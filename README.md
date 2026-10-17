@@ -32,7 +32,7 @@ If `git cow` says it is not a git command, `~/.cargo/bin` is not on your `PATH`:
 
 | Command | What it does |
 |---|---|
-| `git cow add [-b <branch>] [<path>] [<commit-ish>]` | Creates a worktree by cloning the template. Same arguments as `git worktree add`, and without `<path>` it goes to `<cow.root>/<repo>/<last part of the branch>`. Falls back to `git worktree add` when cloning is not possible |
+| `git cow add [-b <branch>] [<path>] [<commit-ish>]` | Creates a worktree by cloning the template. Same arguments as `git worktree add`, and without `<path>` it goes to `<root>/<repo>/<last part of the branch>`, where `<root>` is the `cow.root` setting (default `~/.worktrees`). Falls back to `git worktree add` when cloning is not possible |
 | `git cow list` | Lists the worktrees, path and branch, without the templates |
 | `git cow remove [--warm] [--force] <worktree>` (or `rm`) | Removes a worktree, then deletes its branch only if merged. `--warm` hands its build output to the template first, `--force` removes it with uncommitted changes. It refuses to remove a template or the main checkout |
 | `git cow warm <worktree>` | Refreshes the template with a worktree's gitignored directories, without removing it |
@@ -42,7 +42,7 @@ A git-cow worktree is a normal git worktree, so `git worktree list`, `git worktr
 
 ## How it works
 
-1. Keep one template checkout per repository, moved to `origin/HEAD` before each clone.
+1. Keep one template per repository: a detached git worktree of your repository at `origin/HEAD`, so it shares your `.git` and costs no second copy of the history. New worktrees are cloned from it.
 2. Clone the gitignored directories of your checkout into the template: build output and dependencies, never loose ignored files like `.env`. A hidden directory is shared only when it is on the share list, since the rest (`.claude`, `.codex`, `.aws`) is tool or agent config. This warm-up runs at most once per `cow.warmInterval`.
 3. `git worktree add --no-checkout`, then clone every template entry except `.git` into it. macOS clones each whole directory with one `clonefile(2)` call, Linux uses `cp --reflink=always` (FICLONE).
 4. Copy the template's index, refresh it, and `git reset --hard`, which rewrites only the files where your branch differs from the template.

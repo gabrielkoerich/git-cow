@@ -9,7 +9,8 @@ const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
        git cow share [--global] [<dir>...]
 
 add     creates a worktree by cloning a template checkout, falling back to git worktree add.
-        Without <path> it goes to <cow.root>/<repo>/<last part of the branch name>
+        Without <path> it goes to <root>/<repo>/<last part of the branch name>,
+        <root> being the cow.root setting (default ~/.worktrees)
 list    lists the worktrees, without the templates
 remove  removes a worktree and its branch when merged. --warm hands its build output to the
         template first, --force removes it with uncommitted changes. Never removes a template

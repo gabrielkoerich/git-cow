@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/gabrielkoerich/git-cow/actions/workflows/ci.yml/badge.svg)](https://github.com/gabrielkoerich/git-cow/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/gabrielkoerich/git-cow)](https://github.com/gabrielkoerich/git-cow/releases/latest) [![crates.io](https://img.shields.io/crates/v/git-cow)](https://crates.io/crates/git-cow) [![docs.rs](https://img.shields.io/docsrs/git-cow)](https://docs.rs/git-cow) [![License](https://img.shields.io/crates/l/git-cow)](LICENSE)
 
-Git worktrees that share their build output. Each new worktree is a copy-on-write clone of a template, so `target/`, `node_modules` and other ignored folders take no extra disk until a build changes them. A worktree that would cost gigabytes starts at a few megabytes, and its first build is incremental.
+Git worktrees that share their build output. git-cow keeps one extra checkout of each repository, the base, and makes every new worktree a copy-on-write clone of it. So `target/`, `node_modules` and other ignored folders take no extra disk until a build changes them. A worktree that would cost gigabytes starts at a few megabytes, and its first build is incremental.
 
 ```bash
 git cow add -b feat/login                 # ~/.worktrees/<repo>/login
 git cow add -b feat/login ../login        # any path, like git worktree add
-git cow list                              # your worktrees, without the templates
-git cow remove --warm ~/.worktrees/<repo>/login   # after a merge: share its build output, then remove it
+git cow list                              # your worktrees, without the base checkout
+git cow remove --warm ~/.worktrees/<repo>/login   # after a merge: give its build output to the base, then remove it
 ```
 
 ## Install
@@ -31,18 +31,18 @@ For a different name, add an alias: `git config --global alias.wt '!git-cow'` ma
 |---|---|
 | `git cow add [-b <branch>] [<path>] [<commit-ish>]` | Creates a worktree. Same arguments as `git worktree add`, and the path is optional |
 | `git cow list` | Lists your worktrees and their branches |
-| `git cow remove [--warm] [--force] <worktree>` | Removes a worktree and deletes its branch if merged. `--warm` first gives its build output to the template, `--force` removes it with uncommitted changes. It never removes a template or the main checkout. Also `rm` |
-| `git cow warm <worktree>` | Gives a worktree's build output to the template, and keeps the worktree |
+| `git cow remove [--warm] [--force] <worktree>` | Removes a worktree and deletes its branch if merged. `--warm` first gives its build output to the base, `--force` removes it with uncommitted changes. It never removes the base or your main checkout. Also `rm` |
+| `git cow warm <worktree>` | Gives a worktree's build output to the base, and keeps the worktree |
 | `git cow share [--global] [<dir>...]` | Lists the hidden folders that are shared, or adds one |
 
-These are normal git worktrees, so `git worktree list` and `git worktree remove` work too. `git worktree list` also shows the template. If you remove the template by hand, the next `add` makes a new one.
+These are normal git worktrees, so `git worktree list` and `git worktree remove` work too. `git worktree list` also shows the base checkout. If you remove it by hand, the next `add` makes a new one.
 
 ## How it works
 
-1. Each repository has one template: a git worktree of your repository at `origin/HEAD`. It shares your `.git`, so the history is not stored twice.
-2. The template gets copy-on-write clones of your checkout's ignored folders, such as `target/` and `node_modules`. This runs at most once an hour by default (`cow.warmInterval`).
-3. A new worktree is a clone of the template. macOS clones each folder in one `clonefile(2)` call. Linux uses `cp --reflink=always`.
-4. Git then rewrites only the files where your branch differs from the template.
+1. git-cow keeps one base checkout per repository, at `origin/HEAD`. It is a git worktree of your repository, so it uses your `.git` and the history is not stored twice.
+2. The base gets copy-on-write clones of your checkout's ignored folders, such as `target/` and `node_modules`. This runs at most once an hour by default (`cow.warmInterval`).
+3. A new worktree is a copy-on-write clone of the base. macOS clones each folder in one `clonefile(2)` call. Linux uses `cp --reflink=always`.
+4. Git then rewrites only the files where your branch differs from the base.
 
 If cloning is not possible, git-cow cleans up and runs plain `git worktree add` with your arguments.
 
@@ -55,30 +55,30 @@ All settings are git config, per repository or `--global`. In a path, `{repo}` b
 | Setting | Default | What it sets |
 |---|---|---|
 | `cow.root` | `~/.worktrees` | Where `add` puts a worktree when you give no path: `<root>/<repo>/<branch>`. With `{repo}` in it, `<root>/<branch>` |
-| `cow.template` | `<worktree's parent>/.git-cow/<repo>` | Where the template lives |
+| `cow.base` | `<worktree's parent>/.git-cow/<repo>` | Where the base checkout lives |
 | `cow.share` | | One extra hidden folder to share, per entry |
-| `cow.warmInterval` | `1h` | How often `add` refreshes the template: `0` (always), `30m`, `2h` |
+| `cow.warmInterval` | `1h` | How often `add` refreshes the base from your checkout: `0` (always), `30m`, `2h` |
 | `GIT_COW=0` (environment) | | Turns cloning off |
 
-Because the template follows the worktree's folder, tools with different layouts each get their own: `~/.worktrees/<repo>/.git-cow/<repo>` for `git cow add`, `<repo>/.claude/worktrees/.git-cow/<repo>` for Claude Code. Extra templates take almost no disk, but each is refreshed on its own. To share one template per repository across tools:
+The base sits next to the worktree, so tools with different layouts each get their own: `~/.worktrees/<repo>/.git-cow/<repo>` for `git cow add`, `<repo>/.claude/worktrees/.git-cow/<repo>` for Claude Code. An extra base takes almost no disk, but each is refreshed on its own. To share one base per repository across tools:
 
 ```bash
-git config --global cow.template '~/.orch/state/templates/{repo}'
+git config --global cow.base '~/.orch/state/templates/{repo}'
 ```
 
-Your checkout, the template and the worktrees must sit on one volume that supports cloning: APFS on macOS, btrfs or XFS formatted with `reflink=1` on Linux. On ext4 and HFS+, git-cow falls back to `git worktree add`.
+Your checkout, the base and the worktrees must sit on one volume that supports cloning: APFS on macOS, btrfs or XFS formatted with `reflink=1` on Linux. On ext4 and HFS+, git-cow falls back to `git worktree add`.
 
 ## Library
 
 ```rust
-git_cow::add(repo, template, "origin/main", worktree, Some("feat/x"), None)?;
-git_cow::warm(merged_worktree, template)?;
+git_cow::add(repo, base, "origin/main", worktree, Some("feat/x"), None)?;
+git_cow::warm(merged_worktree, base)?;
 
 let opts = git_cow::Options { share: vec![".venv".into()], ..Default::default() };
-git_cow::add_with(repo, template, "origin/main", worktree, Some("feat/x"), None, &opts)?;
+git_cow::add_with(repo, base, "origin/main", worktree, Some("feat/x"), None, &opts)?;
 ```
 
-The library is synchronous and has no dependencies. A lock file next to the template stops two clones, from threads or processes, from seeing it half updated.
+The library is synchronous and has no dependencies. A lock file next to the base stops two clones, from threads or processes, from seeing it half updated.
 
 ## Benchmarks
 
@@ -91,22 +91,22 @@ orch (Rust), then `cargo test --no-run`:
 | `git worktree add` | 0.3 s | 45.6 s | 1.5 GB |
 | `git cow add` | 0.8 s | 31.7 s | 0.7 GB |
 
-The dependencies come from the template. Cargo still rebuilds the repository's own crates.
+The dependencies come from the base. Cargo still rebuilds the repository's own crates.
 
 bean (Python), then `uv sync`:
 
 | | `uv sync` | Disk |
 |---|---|---|
 | `git worktree add`, new uv cache | 37.5 s | 2.8 GB |
-| `git cow add`, `.uv-cache` cloned | 5.7 s | 0.02 GB |
+| `git cow add`, `.uv-cache` cloned from the base | 5.7 s | 0.02 GB |
 
 ## Costs
 
 - A cloned file's blocks are copied the first time either side writes to it.
 - Clones have new inodes, so git re-hashes every tracked file once. That took about 3 s on a repository with large tracked data.
 - A big shared cache still takes time to clone: about 4 s for a 6.7 GB uv cache.
-- The template can be up to an hour behind your checkout, so a new worktree may rebuild a little more.
-- Tools that store absolute paths, such as virtualenvs, point at the template after a clone.
+- The base can be up to an hour behind your checkout, so a new worktree may rebuild a little more.
+- Tools that store absolute paths, such as virtualenvs, point at the base after a clone.
 - A folder where every file is ignored is shared whole, hidden subfolders included, because git lists it as one entry.
 - Repositories with submodules always fall back.
 

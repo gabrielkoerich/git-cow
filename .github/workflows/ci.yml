@@ -38,3 +38,53 @@ jobs:
         run: echo "GIT_COW_EXPECT_CLONE=1" >> "$GITHUB_ENV"
 
       - run: cargo test
+
+  # On main: next version from conventional commits (feat minor, breaking major, else patch), publish, tag, release
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Next version
+        id: version
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          SUBJECTS=$(git log ${LAST:+"$LAST"..HEAD} --pretty=format:%s)
+          if [ -z "$SUBJECTS" ] || ! echo "$SUBJECTS" | grep -qvE '^(chore|docs|ci)(\(.*\))?:'; then
+            echo "nothing to release since ${LAST:-the start}"
+            exit 0
+          fi
+          if [ -z "$LAST" ]; then
+            V=0.1.0
+          else
+            IFS=. read -r MA MI PA <<< "${LAST#v}"
+            if echo "$SUBJECTS" | grep -qE '^(BREAKING CHANGE:|breaking(\(.*\))?:)'; then V="$((MA + 1)).0.0"
+            elif echo "$SUBJECTS" | grep -qE '^feat(\(.*\))?:'; then V="$MA.$((MI + 1)).0"
+            else V="$MA.$MI.$((PA + 1))"; fi
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "releasing v$V"
+
+      # Publish first: a tag without a crate is worse than a crate without a tag, and a retry then tags it
+      - name: Publish to crates.io
+        if: steps.version.outputs.version
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+          cargo publish --allow-dirty
+
+      - name: Tag and release
+        if: steps.version.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes

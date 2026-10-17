@@ -136,6 +136,11 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
     }
     let _ = fs::remove_dir_all(template);
     let _ = git(repo, &["worktree", "prune"]);
+    if clone_checkout(repo, template, start).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_dir_all(template);
+    let _ = git(repo, &["worktree", "prune"]);
     git(
         repo,
         &[
@@ -146,6 +151,45 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
             start,
         ],
     )?;
+    Ok(())
+}
+
+// Make the extra checkout by cloning the user's checkout, so only files that differ from `start`
+// take disk. Edits, untracked and ignored files are cleaned out, the warm-up adds build output back
+fn clone_checkout(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
+    let top = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
+    let parent = template
+        .parent()
+        .ok_or_else(|| err("template has no parent".into()))?;
+    if !can_clone(&top, parent) {
+        return Err(err("checkout and template cannot share blocks".into()));
+    }
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            &template.to_string_lossy(),
+            start,
+        ],
+    )?;
+    for name in git(&top, &["ls-tree", "--name-only", "HEAD"])?.lines() {
+        let src = top.join(name);
+        if src.symlink_metadata().is_ok() {
+            clone_into(&src, template)?;
+        }
+    }
+    let src_git = git(&top, &["rev-parse", "--absolute-git-dir"])?;
+    let tpl_git = git(template, &["rev-parse", "--absolute-git-dir"])?;
+    fs::copy(
+        Path::new(&src_git).join("index"),
+        Path::new(&tpl_git).join("index"),
+    )?;
+    let _ = git(template, &["update-index", "-q", "--refresh"]);
+    git(template, &["reset", "--hard", "-q"])?;
+    git(template, &["clean", "-fdxq"])?;
     Ok(())
 }
 

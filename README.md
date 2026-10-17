@@ -39,7 +39,7 @@ These are normal git worktrees, so `git worktree list` and `git worktree remove`
 
 ## How it works
 
-1. git-cow keeps one extra checkout per repository, at `origin/HEAD`. It is a git worktree of your repository, so it uses your `.git` and the history is not stored twice.
+1. git-cow keeps one extra checkout per repository, at `origin/HEAD`. It is a git worktree of your repository, so it uses your `.git` and the history is not stored twice. git-cow makes it by cloning your checkout and removing your edits and untracked files, so it takes disk only for the files that differ from `origin/HEAD`.
 2. The extra checkout gets copy-on-write clones of your checkout's ignored folders, such as `target/` and `node_modules`. This runs at most once an hour by default (`cow.warmInterval`).
 3. A new worktree is a copy-on-write clone of the extra checkout. macOS clones each folder in one `clonefile(2)` call. Linux uses `cp --reflink=always`.
 4. Git then rewrites only the files where your branch differs from the extra checkout.
@@ -103,6 +103,7 @@ bean (Python), then `uv sync`:
 ## Costs
 
 - A cloned file's blocks are copied the first time either side writes to it.
+- Making the extra checkout the first time is slower than a plain checkout, about 30 s on a repository with large data folders, because the clone is cleaned before the build folders come back.
 - Clones have new inodes, so git re-hashes every tracked file once. That took about 3 s on a repository with large tracked data.
 - A big shared cache still takes time to clone: about 4 s for a 6.7 GB uv cache.
 - The extra checkout can be up to an hour behind your checkout, so a new worktree may rebuild a little more.

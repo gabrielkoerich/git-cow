@@ -450,3 +450,65 @@ fn cli_expands_repo_in_root_and_template() {
         assert!(scratch.path().join("tpl").join(name).join(".git").exists());
     }
 }
+
+#[test]
+fn extra_checkout_never_carries_the_users_edits_or_untracked_files() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    // a tracked folder, so untracked files can hide inside what gets cloned
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(p.join("src/lib.txt"), "lib\n").unwrap();
+    sh(p, &["add", "src"]);
+    sh(p, &["commit", "-q", "-m", "src"]);
+    sh(p, &["push", "-q", "origin", "HEAD:main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    std::fs::write(p.join("src/lib.txt"), "edited, not committed\n").unwrap();
+    std::fs::write(p.join("src/untracked.txt"), "u\n").unwrap();
+    std::fs::write(p.join("src/.env"), "secret\n").unwrap();
+    std::fs::create_dir_all(p.join("src/.local")).unwrap();
+    std::fs::write(p.join("src/.local/settings"), "x\n").unwrap();
+    std::fs::create_dir_all(p.join("src/out")).unwrap();
+    std::fs::write(p.join("src/out/dep.bin"), "dep\n").unwrap();
+
+    let tpl = scratch.path().join(".git-cow/p");
+    let wt = scratch.path().join("task-7");
+    git_cow::add(
+        p,
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("task-7"),
+        Some("origin/main"),
+    )
+    .unwrap();
+    for root in [&tpl, &wt] {
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.txt")).unwrap(),
+            "lib\n",
+            "an uncommitted edit leaked"
+        );
+        assert!(
+            !root.join("src/untracked.txt").exists(),
+            "an untracked file leaked"
+        );
+        assert!(
+            !root.join("src/.env").exists() && !root.join("src/.local").exists(),
+            "a secret or tool folder leaked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/out/dep.bin")).unwrap(),
+            "dep\n",
+            "build output must still be shared"
+        );
+        assert!(clean(root), "{} must have a clean status", root.display());
+    }
+    // the user's own checkout is untouched
+    assert_eq!(
+        std::fs::read_to_string(p.join("src/lib.txt")).unwrap(),
+        "edited, not committed\n"
+    );
+    assert!(p.join("src/untracked.txt").exists() && p.join("src/.env").exists());
+}

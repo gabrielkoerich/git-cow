@@ -1,5 +1,7 @@
 # git-cow
 
+[![CI](https://github.com/gabrielkoerich/git-cow/actions/workflows/ci.yml/badge.svg)](https://github.com/gabrielkoerich/git-cow/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/gabrielkoerich/git-cow)](https://github.com/gabrielkoerich/git-cow/releases/latest) [![crates.io](https://img.shields.io/crates/v/git-cow)](https://crates.io/crates/git-cow) [![docs.rs](https://img.shields.io/docsrs/git-cow)](https://docs.rs/git-cow) [![License](https://img.shields.io/crates/l/git-cow)](LICENSE)
+
 `git worktree add` that clones files instead of copying them. Every new worktree is a copy-on-write clone of a template checkout, so `target/`, `node_modules` and other build output are shared on disk until a build rewrites them. A worktree that would cost gigabytes starts at a few megabytes and builds incrementally.
 
 ```bash

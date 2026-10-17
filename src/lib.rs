@@ -31,8 +31,22 @@ fn err(msg: String) -> io::Error {
     io::Error::other(msg)
 }
 
-fn defaults() -> Vec<String> {
-    DEFAULT_SHARE.iter().map(|s| s.to_string()).collect()
+/// What to share and how often to refresh the template from the checkout
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Hidden directories shared like any other ignored directory
+    pub share: Vec<String>,
+    /// [`add_with`] warms the template from the checkout at most this often, zero means every time
+    pub warm_interval: std::time::Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            share: DEFAULT_SHARE.iter().map(|s| s.to_string()).collect(),
+            warm_interval: std::time::Duration::from_secs(3600),
+        }
+    }
 }
 
 // Clone `src`, a file or a whole directory, to `dst_dir/<its name>` in one call
@@ -194,16 +208,35 @@ fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()
 /// Refresh an existing `template` with the gitignored directories of `src`, a checkout or a
 /// worktree whose work merged. Shares the hidden directories in [`DEFAULT_SHARE`]
 pub fn warm(src: &Path, template: &Path) -> io::Result<()> {
-    warm_with(src, template, &defaults())
+    warm_with(src, template, &Options::default())
 }
 
-/// [`warm`] with your own list of hidden directories to share
-pub fn warm_with(src: &Path, template: &Path, share: &[String]) -> io::Result<()> {
+/// [`warm`] with your own [`Options`]. It always warms, the interval only applies to [`add_with`]
+pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> {
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
     let _lock = lock_template(template)?;
-    warm_template(src, template, share)
+    warm_template(src, template, &opts.share)?;
+    stamp(template)
+}
+
+// Marks when the template was last warmed, so add_with can skip a warm-up it did recently
+fn stamp_path(template: &Path) -> PathBuf {
+    let name = template.file_name().unwrap_or_default().to_string_lossy();
+    template.with_file_name(format!(".{name}.warmed"))
+}
+
+fn stamp(template: &Path) -> io::Result<()> {
+    fs::write(stamp_path(template), b"")
+}
+
+fn warmed_within(template: &Path, interval: std::time::Duration) -> bool {
+    fs::metadata(stamp_path(template))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < interval)
 }
 
 fn populate(
@@ -261,11 +294,11 @@ pub fn add(
         wt,
         new_branch,
         commitish,
-        &defaults(),
+        &Options::default(),
     )
 }
 
-/// [`add`] with your own list of hidden directories to share
+/// [`add`] with your own [`Options`]
 pub fn add_with(
     repo: &Path,
     template: &Path,
@@ -273,7 +306,7 @@ pub fn add_with(
     wt: &Path,
     new_branch: Option<&str>,
     commitish: Option<&str>,
-    share: &[String],
+    opts: &Options,
 ) -> io::Result<()> {
     let wt_parent = wt
         .parent()
@@ -293,8 +326,12 @@ pub fn add_with(
         // A cloned submodule `.git` file would point into the template's gitdir
         return Err(err("submodules are not supported".into()));
     }
-    // Bare repositories have no ignored files, so the listing fails or is empty and nothing changes
-    let _ = warm_template(repo, template, share);
+    // Re-cloning big caches on every add costs seconds, and a template an hour old only means a
+    // little more rebuilding. Bare repositories have no ignored files, so nothing changes for them
+    if opts.warm_interval.is_zero() || !warmed_within(template, opts.warm_interval) {
+        let _ = warm_template(repo, template, &opts.share);
+        let _ = stamp(template);
+    }
 
     // Only a branch this call creates may be removed on failure, never one that was there before
     let ours = new_branch

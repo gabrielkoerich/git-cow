@@ -191,9 +191,10 @@ fn ignored_dirs_are_shared_but_secrets_and_hidden_dirs_are_not() {
         "the worktree must keep its own gitdir"
     );
 
-    // A second add replaces the shared directory instead of merging into it
     std::fs::remove_file(p.join("out/sub/dep.bin")).unwrap();
     std::fs::write(p.join("out/new.bin"), "new\n").unwrap();
+
+    // Within the warm interval the template is not refreshed from the checkout
     let wt2 = scratch.path().join("task-5");
     git_cow::add(
         p,
@@ -204,8 +205,27 @@ fn ignored_dirs_are_shared_but_secrets_and_hidden_dirs_are_not() {
         Some("origin/main"),
     )
     .unwrap();
-    assert!(wt2.join("out/new.bin").exists());
-    assert!(!wt2.join("out/sub/dep.bin").exists());
+    assert!(wt2.join("out/sub/dep.bin").exists());
+    assert!(!wt2.join("out/new.bin").exists());
+
+    // With no interval it is, and the shared directory is replaced instead of merged into
+    let now = git_cow::Options {
+        warm_interval: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let wt3 = scratch.path().join("task-6");
+    git_cow::add_with(
+        p,
+        &tpl,
+        "origin/main",
+        &wt3,
+        Some("task-6"),
+        Some("origin/main"),
+        &now,
+    )
+    .unwrap();
+    assert!(wt3.join("out/new.bin").exists());
+    assert!(!wt3.join("out/sub/dep.bin").exists());
 }
 
 #[test]
@@ -313,4 +333,120 @@ fn cli_share_adds_a_hidden_directory_to_new_worktrees() {
         .status()
         .unwrap();
     assert!(!bad.success(), "only hidden directory names are accepted");
+}
+
+#[test]
+fn cli_list_hides_templates_and_remove_keeps_unmerged_branches() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let wts = scratch.path().join("wts");
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .args(args)
+            .current_dir(p)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        run(&["add", "-b", "feat/a", wts.join("a").to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        run(&["add", "-b", "feat/b", wts.join("b").to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let listed = String::from_utf8_lossy(&run(&["list"]).stdout).to_string();
+    assert!(listed.contains("feat/a") && listed.contains("feat/b"));
+    assert!(
+        !listed.contains(".git-cow"),
+        "list must hide the template: {listed}"
+    );
+
+    let tpl = wts.join(".git-cow").join(p.file_name().unwrap());
+    assert!(
+        !run(&["remove", tpl.to_str().unwrap()]).status.success(),
+        "a template is never removed"
+    );
+    assert!(tpl.exists());
+
+    // feat/a has no commits of its own, so it is merged and goes; feat/b gets one and stays
+    sh(
+        &wts.join("b"),
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "b",
+        ],
+    );
+    assert!(
+        run(&["remove", wts.join("a").to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        run(&["remove", wts.join("b").to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(!wts.join("a").exists() && !wts.join("b").exists());
+    let branches = Command::new("git")
+        .args(["branch", "--list"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    let branches = String::from_utf8_lossy(&branches.stdout);
+    assert!(!branches.contains("feat/a"), "a merged branch is deleted");
+    assert!(branches.contains("feat/b"), "an unmerged branch is kept");
+}
+
+#[test]
+fn cli_expands_repo_in_root_and_template() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    let name = p.file_name().unwrap().to_str().unwrap();
+    let root = scratch.path().join("r");
+    sh(
+        p,
+        &[
+            "config",
+            "cow.root",
+            &format!("{}/{{repo}}-wts", root.display()),
+        ],
+    );
+    sh(
+        p,
+        &[
+            "config",
+            "cow.template",
+            &format!("{}/tpl/{{repo}}", scratch.path().display()),
+        ],
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(["add", "-b", "feat/x"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(
+        root.join(format!("{name}-wts"))
+            .join("x")
+            .join("a.txt")
+            .exists()
+    );
+    if supported(scratch.path()) {
+        assert!(scratch.path().join("tpl").join(name).join(".git").exists());
+    }
 }

@@ -55,7 +55,7 @@ All settings are git config, per repository or `--global`. In a path, `{repo}` b
 | Setting | Default | What it sets |
 |---|---|---|
 | `cow.root` | `~/.worktrees` | Where `add` puts a worktree when you give no path: `<root>/<repo>/<branch>`. With `{repo}` in it, `<root>/<branch>` |
-| `cow.checkout` | `<worktree's parent>/.git-cow/<repo>` | Where the extra checkout lives |
+| `cow.base` | `<worktree's parent>/.git-cow/<repo>` | Where the extra checkout lives |
 | `cow.share` | | One extra hidden folder to share, per entry |
 | `cow.warmInterval` | `1h` | How often `add` refreshes the extra checkout from your checkout: `0` (always), `30m`, `2h` |
 | `GIT_COW=0` (environment) | | Turns cloning off |
@@ -63,7 +63,7 @@ All settings are git config, per repository or `--global`. In a path, `{repo}` b
 The extra checkout sits next to the worktree, so tools with different layouts each get their own: `~/.worktrees/<repo>/.git-cow/<repo>` for `git cow add`, `<repo>/.claude/worktrees/.git-cow/<repo>` for Claude Code. Another extra checkout takes almost no disk, but each is refreshed on its own. To share one extra checkout per repository across tools:
 
 ```bash
-git config --global cow.checkout '~/.orch/state/templates/{repo}'
+git config --global cow.base '~/.orch/state/templates/{repo}'
 ```
 
 Your checkout, the extra checkout and the worktrees must sit on one volume that supports cloning: APFS on macOS, btrfs or XFS formatted with `reflink=1` on Linux. On ext4 and HFS+, git-cow falls back to `git worktree add`.

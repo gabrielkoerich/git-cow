@@ -21,7 +21,7 @@ share   lists the hidden directories shared with every worktree, or adds to them
 
 git config ({repo} in a path is replaced by the repository's name):
   cow.root          where worktrees go when <path> is left out (default ~/.worktrees)
-  cow.checkout      the extra checkout (default <worktree's parent>/.git-cow/<repo>)
+  cow.base          where the extra checkout lives (default <worktree's parent>/.git-cow/<repo>)
   cow.share         a hidden directory to share on top of the built-in caches, one per entry
   cow.warmInterval  how often add refreshes the extra checkout from your checkout: 0, 30m, 1h (default 1h)
 GIT_COW=0 disables cloning";
@@ -142,8 +142,7 @@ fn repo_name(dir: &Path) -> std::io::Result<String> {
 
 fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
     // cow.template is the 0.1 name
-    if let Some(t) = config_path(repo, "cow.checkout").or_else(|| config_path(repo, "cow.template"))
-    {
+    if let Some(t) = config_path(repo, "cow.base").or_else(|| config_path(repo, "cow.template")) {
         return Ok(t);
     }
     let parent = wt.parent().unwrap_or(Path::new("."));
@@ -152,7 +151,7 @@ fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
 
 fn is_template(repo: &Path, path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".git-cow")
-        || config_path(repo, "cow.checkout")
+        || config_path(repo, "cow.base")
             .or_else(|| config_path(repo, "cow.template"))
             .is_some_and(|t| t == path)
 }

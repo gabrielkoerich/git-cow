@@ -8,22 +8,22 @@ const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
        git cow warm <worktree>
        git cow share [--global] [<dir>...]
 
-add     creates a worktree as a copy-on-write clone of the base checkout, falling back to
-        git worktree add.
-        Without <path> it goes to <root>/<repo>/<last part of the branch name>,
+add     creates a worktree as a copy-on-write clone of the extra checkout, or with git worktree
+        add when cloning is not possible. Without <path> it goes to <root>/<repo>/<last part of the branch name>,
         <root> being the cow.root setting (default ~/.worktrees)
-list    lists the worktrees, without the base checkout
-remove  removes a worktree and its branch when merged. --warm gives its build output to the
-        base first, --force removes it with uncommitted changes. Never removes the base
-warm    gives a worktree's gitignored directories to the base, run it after a merge
+list    lists the worktrees, without the extra checkout
+remove  removes a worktree and its branch when merged. --warm first gives its build output to
+        the extra checkout, --force removes it with uncommitted changes. Never removes the extra
+        checkout or your main checkout
+warm    gives a worktree's gitignored directories to the extra checkout, run it after a merge
 share   lists the hidden directories shared with every worktree, or adds to them in git config.
         Ignored directories are shared, but a hidden one only when listed, the rest is tool config
 
 git config ({repo} in a path is replaced by the repository's name):
   cow.root          where worktrees go when <path> is left out (default ~/.worktrees)
-  cow.base          the base checkout (default <worktree's parent>/.git-cow/<repo>)
+  cow.checkout      the extra checkout (default <worktree's parent>/.git-cow/<repo>)
   cow.share         a hidden directory to share on top of the built-in caches, one per entry
-  cow.warmInterval  how often add refreshes the base from your checkout: 0, 30m, 1h (default 1h)
+  cow.warmInterval  how often add refreshes the extra checkout from your checkout: 0, 30m, 1h (default 1h)
 GIT_COW=0 disables cloning";
 
 fn main() -> ExitCode {
@@ -142,7 +142,8 @@ fn repo_name(dir: &Path) -> std::io::Result<String> {
 
 fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
     // cow.template is the 0.1 name
-    if let Some(t) = config_path(repo, "cow.base").or_else(|| config_path(repo, "cow.template")) {
+    if let Some(t) = config_path(repo, "cow.checkout").or_else(|| config_path(repo, "cow.template"))
+    {
         return Ok(t);
     }
     let parent = wt.parent().unwrap_or(Path::new("."));
@@ -151,7 +152,7 @@ fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
 
 fn is_template(repo: &Path, path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".git-cow")
-        || config_path(repo, "cow.base")
+        || config_path(repo, "cow.checkout")
             .or_else(|| config_path(repo, "cow.template"))
             .is_some_and(|t| t == path)
 }
@@ -296,7 +297,7 @@ fn remove(args: &[String]) -> std::io::Result<()> {
     };
     if is_template(&repo, &wt) {
         return Err(other(format!(
-            "{} is the git-cow base checkout, not removed",
+            "{} is the git-cow extra checkout, not removed",
             wt.display()
         )));
     }

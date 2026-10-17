@@ -430,7 +430,7 @@ fn cli_expands_repo_in_root_and_template() {
         p,
         &[
             "config",
-            "cow.base",
+            "cow.checkout",
             &format!("{}/tpl/{{repo}}", scratch.path().display()),
         ],
     );

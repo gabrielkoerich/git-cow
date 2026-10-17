@@ -1,5 +1,5 @@
 //! Git worktrees cloned from a per-repository template checkout, sharing disk blocks until written.
-//! macOS clones with `cp -c` (clonefile), Linux with `cp --reflink=always` (FICLONE)
+//! macOS clones whole directories with clonefile(2), Linux uses `cp --reflink=always` (FICLONE)
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -7,6 +7,21 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
+
+/// Hidden directories that hold only build caches, so they are shared like any other ignored
+/// directory. Every other path with a hidden component is tool or agent config and stays out
+pub const DEFAULT_SHARE: &[&str] = &[
+    ".uv-cache",
+    ".next",
+    ".turbo",
+    ".nuxt",
+    ".svelte-kit",
+    ".parcel-cache",
+    ".gradle",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+];
 
 // Clone support per (source dir, destination dir), probed once per process
 static PROBES: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), bool>>> =
@@ -16,20 +31,38 @@ fn err(msg: String) -> io::Error {
     io::Error::other(msg)
 }
 
-fn clone_flags() -> &'static [&'static str] {
-    if cfg!(target_os = "macos") {
-        &["-cRp"]
-    } else {
-        // fails instead of copying when the volume cannot clone
-        &["-a", "--reflink=always"]
-    }
+fn defaults() -> Vec<String> {
+    DEFAULT_SHARE.iter().map(|s| s.to_string()).collect()
 }
 
-fn clone_path(src: &Path, dst: &Path) -> io::Result<()> {
+// Clone `src`, a file or a whole directory, to `dst_dir/<its name>` in one call
+#[cfg(target_os = "macos")]
+fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
+    use std::ffi::{CString, c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
+    }
+    const CLONE_NOFOLLOW: u32 = 1;
+    let name = src
+        .file_name()
+        .ok_or_else(|| err(format!("{} has no name", src.display())))?;
+    let s = CString::new(src.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let d = CString::new(dst_dir.join(name).as_os_str().as_bytes()).map_err(io::Error::other)?;
+    if unsafe { clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(err(format!("clonefile {}: {e}", src.display())));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
+    // fails instead of copying when the volume cannot clone
     let out = Command::new("cp")
-        .args(clone_flags())
+        .args(["-a", "--reflink=always"])
         .arg(src)
-        .arg(dst)
+        .arg(dst_dir)
         .output()?;
     if !out.status.success() {
         return Err(err(format!(
@@ -60,12 +93,14 @@ pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     if let Some(known) = PROBES.lock().unwrap().get(&key) {
         return *known;
     }
-    let src = src_dir.join(".cow-probe-src");
-    let dst = dst_dir.join(".cow-probe-dst");
-    let _ = fs::remove_file(&dst);
-    let ok = fs::write(&src, b"x").is_ok() && clone_path(&src, &dst).is_ok();
+    let id = std::process::id();
+    let src = src_dir.join(format!(".cow-probe-{id}"));
+    let into = dst_dir.join(format!(".cow-probe-dir-{id}"));
+    let ok = fs::write(&src, b"x").is_ok()
+        && fs::create_dir_all(&into).is_ok()
+        && clone_into(&src, &into).is_ok();
     let _ = fs::remove_file(&src);
-    let _ = fs::remove_file(&dst);
+    let _ = fs::remove_dir_all(&into);
     PROBES.lock().unwrap().insert(key, ok);
     ok
 }
@@ -101,8 +136,8 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
 }
 
 // Gitignored directories of a checkout at any depth, which hold whatever its tooling produced.
-// A path with a hidden component is local tool or agent config, so it is never shared
-fn ignored_dirs(src: &Path) -> io::Result<Vec<String>> {
+// A hidden component must be in `share`, anything else hidden is tool or agent config
+fn ignored_dirs(src: &Path, share: &[String]) -> io::Result<Vec<String>> {
     let out = git(
         src,
         &[
@@ -116,17 +151,21 @@ fn ignored_dirs(src: &Path) -> io::Result<Vec<String>> {
     Ok(out
         .lines()
         .filter_map(|l| l.strip_suffix('/'))
-        .filter(|n| !n.is_empty() && !n.split('/').any(|c| c.starts_with('.')))
+        .filter(|n| {
+            !n.is_empty()
+                && n.split('/')
+                    .all(|c| !c.starts_with('.') || share.iter().any(|s| s == c))
+        })
         .map(String::from)
         .collect())
 }
 
 // Swap a clone of each ignored directory of `src` into the template. Loose ignored files stay
 // out, so local secrets such as .env never reach a worktree
-fn warm_template(src: &Path, template: &Path) -> io::Result<()> {
+fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()> {
     let name = template.file_name().unwrap_or_default().to_string_lossy();
     let staging = template.with_file_name(format!(".{name}.warm"));
-    for dir in ignored_dirs(src)? {
+    for dir in ignored_dirs(src, share)? {
         // A directory the template commit tracks is not build output
         if !git(template, &["ls-files", "--", &dir])
             .unwrap_or_default()
@@ -138,7 +177,7 @@ fn warm_template(src: &Path, template: &Path) -> io::Result<()> {
         fs::create_dir_all(&staging)?;
         // One directory that cannot be cloned only costs that directory's sharing
         let _ = (|| {
-            clone_path(&src.join(&dir), &staging)?;
+            clone_into(&src.join(&dir), &staging)?;
             let dst = template.join(&dir);
             let _ = fs::remove_dir_all(&dst);
             if let Some(parent) = dst.parent() {
@@ -153,13 +192,18 @@ fn warm_template(src: &Path, template: &Path) -> io::Result<()> {
 }
 
 /// Refresh an existing `template` with the gitignored directories of `src`, a checkout or a
-/// worktree whose work merged
+/// worktree whose work merged. Shares the hidden directories in [`DEFAULT_SHARE`]
 pub fn warm(src: &Path, template: &Path) -> io::Result<()> {
+    warm_with(src, template, &defaults())
+}
+
+/// [`warm`] with your own list of hidden directories to share
+pub fn warm_with(src: &Path, template: &Path, share: &[String]) -> io::Result<()> {
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
     let _lock = lock_template(template)?;
-    warm_template(src, template)
+    warm_template(src, template, share)
 }
 
 fn populate(
@@ -184,7 +228,7 @@ fn populate(
         if entry.file_name() == ".git" {
             continue;
         }
-        clone_path(&entry.path(), wt)?;
+        clone_into(&entry.path(), wt)?;
     }
 
     // The template index describes the cloned files. Refresh its stat data for the new inodes,
@@ -210,6 +254,27 @@ pub fn add(
     new_branch: Option<&str>,
     commitish: Option<&str>,
 ) -> io::Result<()> {
+    add_with(
+        repo,
+        template,
+        template_start,
+        wt,
+        new_branch,
+        commitish,
+        &defaults(),
+    )
+}
+
+/// [`add`] with your own list of hidden directories to share
+pub fn add_with(
+    repo: &Path,
+    template: &Path,
+    template_start: &str,
+    wt: &Path,
+    new_branch: Option<&str>,
+    commitish: Option<&str>,
+    share: &[String],
+) -> io::Result<()> {
     let wt_parent = wt
         .parent()
         .ok_or_else(|| err("worktree has no parent".into()))?;
@@ -229,7 +294,7 @@ pub fn add(
         return Err(err("submodules are not supported".into()));
     }
     // Bare repositories have no ignored files, so the listing fails or is empty and nothing changes
-    let _ = warm_template(repo, template);
+    let _ = warm_template(repo, template, share);
 
     // Only a branch this call creates may be removed on failure, never one that was there before
     let ours = new_branch

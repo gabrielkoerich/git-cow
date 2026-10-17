@@ -41,7 +41,7 @@ fn setup() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
     std::fs::write(project.path().join("d.txt"), "d\n").unwrap();
     std::fs::write(
         project.path().join(".gitignore"),
-        "out/\n.env\n.local/\nnode/\n",
+        "out/\n.env\n.local/\nnode/\n.uv-cache/\n.venv/\n",
     )
     .unwrap();
     sh(project.path(), &["add", "."]);
@@ -150,6 +150,8 @@ fn ignored_dirs_are_shared_but_secrets_and_hidden_dirs_are_not() {
     // an untracked file keeps git from reporting pkg/ as one fully ignored directory
     std::fs::write(p.join("pkg/a/keep.txt"), "k\n").unwrap();
     std::fs::write(p.join(".env"), "secret\n").unwrap();
+    std::fs::create_dir_all(p.join(".uv-cache/wheels")).unwrap();
+    std::fs::write(p.join(".uv-cache/wheels/w.whl"), "wheel\n").unwrap();
 
     let tpl = scratch.path().join(".git-cow/p");
     let wt = scratch.path().join("task-4");
@@ -173,6 +175,11 @@ fn ignored_dirs_are_shared_but_secrets_and_hidden_dirs_are_not() {
         );
         assert!(!root.join(".env").exists(), "loose ignored file was copied");
         assert!(!root.join(".local").exists(), "hidden dir was copied");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".uv-cache/wheels/w.whl")).unwrap(),
+            "wheel\n",
+            "a built-in shared cache must be cloned"
+        );
         assert!(
             !root.join("pkg/a/.hidden").exists(),
             "nested hidden dir was copied"
@@ -268,4 +275,42 @@ fn cli_puts_a_pathless_worktree_under_cow_root() {
     let wt = root.join(name).join("login");
     assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
     assert!(clean(&wt));
+}
+
+#[test]
+fn cli_share_adds_a_hidden_directory_to_new_worktrees() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    std::fs::create_dir_all(p.join(".venv/lib")).unwrap();
+    std::fs::write(p.join(".venv/lib/x.py"), "x\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let out = Command::new(bin)
+        .args(["share", ".venv"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.lines().any(|l| l == ".venv") && listed.lines().any(|l| l == ".uv-cache"));
+    let wt = scratch.path().join("wt-share");
+    let st = Command::new(bin)
+        .args(["add", "-b", "share-test"])
+        .arg(&wt)
+        .current_dir(p)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(
+        std::fs::read_to_string(wt.join(".venv/lib/x.py")).unwrap(),
+        "x\n"
+    );
+    let bad = Command::new(bin)
+        .args(["share", "target"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    assert!(!bad.success(), "only hidden directory names are accepted");
 }

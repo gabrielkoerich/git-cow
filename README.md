@@ -30,18 +30,22 @@ If `git cow` says it is not a git command, `~/.cargo/bin` is not on your `PATH`:
 ## How it works
 
 1. Keep one template checkout per repository at `<worktree's parent>/.git-cow/<repo>`, moved to `origin/HEAD` before each clone.
-2. Clone the gitignored directories of your checkout into the template: build output and dependencies, never loose ignored files like `.env` and never paths with a hidden component.
-3. `git worktree add --no-checkout`, then clone every template entry except `.git` into it. macOS uses `cp -c` (clonefile), Linux `cp --reflink=always` (FICLONE).
+2. Clone the gitignored directories of your checkout into the template: build output and dependencies, never loose ignored files like `.env`. A hidden directory is shared only when it is on the share list, since the rest (`.claude`, `.codex`, `.aws`) is tool or agent config.
+3. `git worktree add --no-checkout`, then clone every template entry except `.git` into it. macOS clones each whole directory with one `clonefile(2)` call, Linux uses `cp --reflink=always` (FICLONE).
 4. Copy the template's index, refresh it, and `git reset --hard`, which rewrites only the files where your branch differs from the template.
 
 If the volume cannot clone, or anything fails, it removes what it made and runs plain `git worktree add` with the same arguments.
 
 ## Configuration
 
+Hidden directories shared by default, all pure build caches: `.uv-cache`, `.next`, `.turbo`, `.nuxt`, `.svelte-kit`, `.parcel-cache`, `.gradle`, `.mypy_cache`, `.ruff_cache`, `.pytest_cache`. Add your own with `git cow share <dir>`, or `--global` for every repository. A virtualenv only works after a clone if it was created relocatable, since it stores absolute paths.
+
+
 | | Default | |
 |---|---|---|
 | `git config cow.root` | `~/.worktrees` | Where a worktree goes when the path is left out: `<root>/<repo>/<last part of the branch>` |
 | `git config cow.template` | `<worktree's parent>/.git-cow/<repo>` | The template checkout |
+| `git config cow.share` | | A hidden directory to share on top of the built-in caches, one entry each. `git cow share .venv` adds one, `git cow share` lists them |
 | `GIT_COW=0` | | Plain `git worktree add` |
 
 The checkout, the template and the worktrees must be on one volume that clones: APFS on macOS, XFS formatted with `reflink=1` or btrfs on Linux. ext4 and HFS+ always fall back.

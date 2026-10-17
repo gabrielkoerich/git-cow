@@ -3,14 +3,18 @@ use std::process::{Command, ExitCode};
 
 const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
        git cow warm <worktree>
+       git cow share [--global] [<dir>...]
 
 add   creates a worktree by cloning a template checkout, falling back to git worktree add.
       Without <path> it goes to <cow.root>/<repo>/<last part of the branch name>
 warm  refreshes the template with a worktree's gitignored directories, run it after a merge
+share lists the hidden directories shared with every worktree, or adds to them in git config.
+      Ignored directories are shared, but a hidden one only when listed, the rest is tool config
 
 git config:
   cow.root      where worktrees go when <path> is left out (default ~/.worktrees)
   cow.template  the template checkout (default <worktree's parent>/.git-cow/<repo>)
+  cow.share     a hidden directory to share on top of the built-in caches, one per entry
 GIT_COW=0 disables cloning";
 
 fn main() -> ExitCode {
@@ -18,6 +22,7 @@ fn main() -> ExitCode {
     let res = match args.first().map(String::as_str) {
         Some("add") => return add(&args[1..]),
         Some("warm") if args.len() == 2 => warm(Path::new(&args[1])),
+        Some("share") => share(&args[1..]),
         _ => return usage(),
     };
     match res {
@@ -41,6 +46,44 @@ fn config(repo: &Path, key: &str) -> Option<PathBuf> {
         Some(rest) => Path::new(&home).join(rest),
         None => PathBuf::from(v),
     })
+}
+
+// The built-in caches plus every cow.share entry in git config
+fn share_list(repo: &Path) -> Vec<String> {
+    let mut list: Vec<String> = git_cow::DEFAULT_SHARE
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let extra = git_cow::git(repo, &["config", "--get-all", "cow.share"]).unwrap_or_default();
+    for d in extra.lines().map(str::trim).filter(|d| !d.is_empty()) {
+        if !list.iter().any(|l| l == d) {
+            list.push(d.to_string());
+        }
+    }
+    list
+}
+
+fn share(args: &[String]) -> std::io::Result<()> {
+    let repo = std::env::current_dir()?;
+    let global = args.iter().any(|a| a == "--global");
+    let dirs: Vec<&String> = args.iter().filter(|a| *a != "--global").collect();
+    let have = share_list(&repo);
+    for d in dirs {
+        if !d.starts_with('.') || d.contains('/') {
+            return Err(std::io::Error::other(format!(
+                "{d}: give a hidden directory name like .venv, other ignored directories are shared already"
+            )));
+        }
+        if have.iter().any(|h| h == d) {
+            continue;
+        }
+        let scope = if global { "--global" } else { "--local" };
+        git_cow::git(&repo, &["config", scope, "--add", "cow.share", d])?;
+    }
+    for d in share_list(&repo) {
+        println!("{d}");
+    }
+    Ok(())
 }
 
 // The repository's name: its directory, or a bare repository's name without `.git`
@@ -114,13 +157,14 @@ fn add(args: &[String]) -> ExitCode {
         } else {
             "HEAD"
         };
-        git_cow::add(
+        git_cow::add_with(
             &repo,
             &template,
             start,
             &wt,
             new_branch,
             rest.get(1).map(String::as_str),
+            &share_list(&repo),
         )?;
         println!("{}", wt.display());
         Ok(())
@@ -148,5 +192,5 @@ fn plain(args: &[String], why: &str) -> ExitCode {
 fn warm(wt: &Path) -> std::io::Result<()> {
     let wt = std::path::absolute(wt)?;
     let template = template_for(&wt, &wt)?;
-    git_cow::warm(&wt, &template)
+    git_cow::warm_with(&wt, &template, &share_list(&wt))
 }

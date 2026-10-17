@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - {os: macos-latest, fs: apfs}
+          - {os: ubuntu-latest, fs: xfs}
+          - {os: ubuntu-latest, fs: ext4}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+      # The clone path only runs on a volume that clones, so the tests fail if the probe finds none
+      - name: XFS reflink volume
+        if: matrix.fs == 'xfs'
+        run: |
+          command -v mkfs.xfs >/dev/null || sudo apt-get install -y xfsprogs
+          truncate -s 4G /tmp/xfs.img
+          mkfs.xfs -m reflink=1 /tmp/xfs.img
+          sudo mkdir -p /mnt/xfs && sudo mount -o loop /tmp/xfs.img /mnt/xfs
+          sudo mkdir /mnt/xfs/tmp && sudo chown -R "$USER" /mnt/xfs
+          echo "TMPDIR=/mnt/xfs/tmp" >> "$GITHUB_ENV"
+          echo "GIT_COW_EXPECT_CLONE=1" >> "$GITHUB_ENV"
+      - name: Require cloning on APFS
+        if: matrix.fs == 'apfs'
+        run: echo "GIT_COW_EXPECT_CLONE=1" >> "$GITHUB_ENV"
+
+      - run: cargo test

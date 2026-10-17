@@ -1,0 +1,16 @@
+[package]
+name = "git-cow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Git worktrees that share files with a template through copy-on-write clones (APFS, XFS, btrfs)"
+license = "MIT"
+repository = "https://github.com/gabrielkoerich/git-cow"
+readme = "README.md"
+keywords = ["git", "worktree", "copy-on-write", "reflink", "clonefile"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"

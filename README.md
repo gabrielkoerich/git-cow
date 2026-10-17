@@ -3,13 +3,27 @@
 `git worktree add` that clones files instead of copying them. Every new worktree is a copy-on-write clone of a template checkout, so `target/`, `node_modules` and other build output are shared on disk until a build rewrites them. A worktree that would cost gigabytes starts at a few megabytes and builds incrementally.
 
 ```bash
-cargo install git-cow
 git cow add -b feat/login                 # ~/.worktrees/<repo>/login
 git cow add -b feat/login ../login        # any path, like git worktree add
 git cow warm ~/.worktrees/<repo>/login    # after a merge, share its build output with the next worktree
 ```
 
-A binary named `git-cow` on your PATH is a git subcommand, so `git cow` works once it is installed.
+## Install
+
+```bash
+cargo install git-cow   # into ~/.cargo/bin
+```
+
+### The `git cow` subcommand
+
+Git runs any executable named `git-<name>` on your `PATH` as `git <name>`. The install puts a `git-cow` binary on your `PATH`, so `git cow` works with no extra setup. Check it with:
+
+```bash
+command -v git-cow   # prints the binary's path
+git cow              # prints the usage
+```
+
+If `git cow` says it is not a git command, `~/.cargo/bin` is not on your `PATH`: add `export PATH="$HOME/.cargo/bin:$PATH"` to your shell profile. To use another name, add an alias: `git config --global alias.wt '!git-cow'` makes `git wt add -b feat/x` work.
 
 ## How it works
 

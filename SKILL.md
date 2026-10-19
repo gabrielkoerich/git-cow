@@ -5,17 +5,13 @@ description: >
   git cow command. It uses copy-on-write, so a new worktree shares files
   and uses less disk space. A worktree you create goes in ~/.worktrees/<project>/.
   A worktree Claude Code already created under <project>/.claude/worktrees
-  uses the same commands. Start a feature branch there, then commit, push,
-  and open a pull request. Never call the git worktree command yourself.
-  A GitHub issue uses the github-issue-worktree skill. Use when the user
-  wants a worktree or runs /git-worktrees.
+  uses the same commands. Never call the git worktree command yourself.
+  Use when the user wants a worktree or runs /git-worktrees.
 ---
 
 # git-worktrees
 
-This skill is `git-worktrees`. Call the `git cow` command only. Run it from a checkout of the repository. Never run the `git worktree` command.
-
-A GitHub issue uses the github-issue-worktree skill. That skill follows this one for the worktree.
+Call the `git cow` command only. Run it from a checkout of the repository. Never run the `git worktree` command.
 
 ## Install
 
@@ -131,61 +127,3 @@ For the default directory, that is `~/.worktrees/<project>/.git-cow/<project>`. 
 Ignored directories such as `target/` and `node_modules` are cloned into the new worktree. Loose ignored files such as `.env` stay out.
 
 A hidden directory is cloned only when it is on the share list. The built-in names are `.uv-cache`, `.next`, `.turbo`, `.nuxt`, `.svelte-kit`, `.parcel-cache`, `.gradle`, `.mypy_cache`, `.ruff_cache`, and `.pytest_cache`. Add one with `git cow share <name>`. The name starts with `.` and contains no slash. Share `.venv` only when that virtualenv was created relocatable, because it stores absolute paths.
-
-## Feature branch
-
-Use this when the work is a feature branch and a pull request. The repository has `origin`. `gh` is authenticated for this repo.
-
-```bash
-git remote -v
-gh auth status
-gh repo view
-```
-
-Use the feature name the user gave. If the request implies one name, use that. If it is ambiguous, ask: `What feature name should I use for the branch?`
-
-- `featureSlug`: lowercase, turn each run of other characters into `-`, trim `-`, cut at 40 characters
-- `BRANCH_NAME`: `feat/<featureSlug>`
-- `BASE_BRANCH`: `main`, unless the user names another base
-
-```bash
-featureSlug=$(printf '%s' "$FEATURE_NAME" \
-  | tr '[:upper:]' '[:lower:]' \
-  | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g' \
-  | cut -c1-40)
-BRANCH_NAME="feat/$featureSlug"
-BASE_BRANCH="${BASE_BRANCH:-main}"
-```
-
-Create `BRANCH_NAME` with the rules above, starting at `origin/$BASE_BRANCH`. Work in the path the command prints.
-
-Edit and run tests in that worktree. Commit with a subject only.
-
-```bash
-git add -A
-git commit -m "feat: implement $featureSlug"
-git push -u origin "$BRANCH_NAME"
-```
-
-Open the pull request. Use the commit subjects between the base and `HEAD` as the summary.
-
-```bash
-PR_BODY=$(cat <<PR
-## Summary
-
-$(git log --no-merges --pretty='- %s' "origin/$BASE_BRANCH..HEAD")
-
-## Testing
-
-- [ ] Add testing notes
-PR
-)
-
-gh pr create \
-  --base "$BASE_BRANCH" \
-  --head "$BRANCH_NAME" \
-  --title "feat: $featureSlug" \
-  --body "$PR_BODY"
-```
-
-After the merge, go to the main checkout and remove the worktree with `git cow remove --warm`.

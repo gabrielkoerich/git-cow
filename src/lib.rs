@@ -399,3 +399,4 @@ pub fn add_with(
 // cowbench s3
 // cowbench g1
 // cowbench g1b
+// cowbench g2

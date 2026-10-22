@@ -13,7 +13,7 @@ jobs:
           - {os: macos-latest, fs: apfs}
           - {os: ubuntu-latest, fs: xfs}
           - {os: ubuntu-latest, fs: ext4}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.fs == 'ext4' && fromJSON('["self-hosted", "cowbench"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

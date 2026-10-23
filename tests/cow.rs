@@ -651,3 +651,67 @@ fn add_never_prunes_other_worktrees() {
         "git-cow removed another worktree's registration"
     );
 }
+
+#[test]
+fn probe_leaves_no_files_and_keeps_its_answer() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (src, dst) = (scratch.path().join("src"), scratch.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    let first = git_cow::can_clone(&src, &dst);
+    assert_eq!(first, supported(scratch.path()));
+    assert_eq!(git_cow::can_clone(&src, &dst), first);
+    for d in [&src, &dst] {
+        assert_eq!(
+            std::fs::read_dir(d).unwrap().count(),
+            0,
+            "probe left a file"
+        );
+    }
+}
+
+#[test]
+fn add_failing_after_git_registered_the_worktree_leaves_nothing() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    // a required smudge filter that fails, so the reset in the new worktree fails
+    sh(p, &["config", "filter.boom.smudge", "false"]);
+    sh(p, &["config", "filter.boom.clean", "cat"]);
+    sh(p, &["config", "filter.boom.required", "true"]);
+    sh(p, &["checkout", "-q", "-b", "clash", "origin/main"]);
+    std::fs::write(p.join(".gitattributes"), "*.dat filter=boom\n").unwrap();
+    std::fs::write(p.join("x.dat"), "x\n").unwrap();
+    sh(p, &["add", "-A"]);
+    sh(p, &["commit", "-q", "-m", "clash"]);
+    sh(p, &["checkout", "-q", "--detach", "origin/main"]);
+
+    let wt = scratch.path().join("t1");
+    let res = git_cow::add(
+        p,
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &wt,
+        Some("t1"),
+        Some("clash"),
+    );
+    assert!(res.is_err(), "the clash must fail populate");
+    assert!(!wt.exists());
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("/t1\n"),
+        "a failed add left its registration"
+    );
+    let out = Command::new("git")
+        .args(["branch", "--list", "t1"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "a failed add left its branch");
+}

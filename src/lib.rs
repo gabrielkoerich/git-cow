@@ -37,6 +37,7 @@ pub struct Options {
     /// Hidden directories shared like any other ignored directory
     pub share: Vec<String>,
     /// [`add_with`] warms the template from the checkout at most this often, zero means every time
+    /// and `Duration::MAX` never
     pub warm_interval: std::time::Duration,
 }
 
@@ -69,9 +70,12 @@ impl Options {
     }
 }
 
-// "0", "90" (seconds), "30m", "1h"
+// "0", "90" (seconds), "30m", "1h", "never"
 fn parse_interval(v: &str) -> Option<std::time::Duration> {
     let v = v.trim();
+    if v == "never" {
+        return Some(std::time::Duration::MAX);
+    }
     let (n, unit) = match v.strip_suffix('h') {
         Some(n) => (n, 3600),
         None => match v.strip_suffix('m') {
@@ -438,7 +442,8 @@ pub fn add_with(
     }
     // Re-cloning big caches on every add costs seconds, and a template an hour old only means a
     // little more rebuilding. Bare repositories have no ignored files, so nothing changes for them
-    if opts.warm_interval.is_zero() || !warmed_within(template, opts.warm_interval) {
+    let never = opts.warm_interval == std::time::Duration::MAX;
+    if !never && (opts.warm_interval.is_zero() || !warmed_within(template, opts.warm_interval)) {
         let _ = warm_template(repo, template, &opts.share);
         let _ = stamp(template);
     }

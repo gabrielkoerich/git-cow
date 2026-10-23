@@ -57,7 +57,7 @@ All settings are git config, per repository or `--global`. In a path, `{repo}` b
 | `cow.root` | `~/.worktrees` | Where `add` puts a worktree when you give no path: `<root>/<repo>/<branch>`. With `{repo}` in it, `<root>/<branch>` |
 | `cow.base` | `<worktree's parent>/.git-cow/<repo>` | Where the extra checkout lives |
 | `cow.share` | | One extra hidden folder to share, per entry |
-| `cow.warmInterval` | `1h` | How often `add` refreshes the extra checkout from your checkout: `0` (always), `30m`, `2h` |
+| `cow.warmInterval` | `1h` | How often `add` refreshes the extra checkout from your checkout: `0` (always), `30m`, `2h`, `never` |
 | `GIT_COW=0` (environment) | | Turns cloning off |
 
 The extra checkout sits next to the worktree, so tools with different layouts each get their own: `~/.worktrees/<repo>/.git-cow/<repo>` for `git cow add`, `<repo>/.claude/worktrees/.git-cow/<repo>` for Claude Code. Another extra checkout takes almost no disk, but each is refreshed on its own. To share one extra checkout per repository across tools:

@@ -832,3 +832,85 @@ fn remove_template_leaves_nothing_and_add_makes_it_again() {
     add("w2").unwrap();
     assert!(clean(&scratch.path().join("w2")));
 }
+
+// git-cow refuses submodules on every volume, so this fails the clone wherever the test runs
+fn with_gitmodules(p: &Path) {
+    std::fs::write(p.join(".gitmodules"), "").unwrap();
+    sh(p, &["add", ".gitmodules"]);
+    sh(p, &["commit", "-q", "-m", "gitmodules"]);
+    sh(p, &["push", "-q", "origin", "HEAD:main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+}
+
+#[test]
+fn plain_worktree_add_works_after_a_failed_add() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    with_gitmodules(p);
+    let wt = scratch.path().join("w1");
+    let res = git_cow::add(
+        p,
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &wt,
+        Some("w1"),
+        Some("origin/main"),
+    );
+    assert!(res.is_err());
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "w1",
+            wt.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    assert!(clean(&wt));
+}
+
+#[test]
+fn add_or_plain_clones_or_falls_back() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    let tpl = scratch.path().join(".git-cow/p");
+    let opts = git_cow::Options::default();
+    let add = |name: &str| {
+        git_cow::add_or_plain(
+            p,
+            &tpl,
+            "origin/main",
+            &scratch.path().join(name),
+            Some(name),
+            Some("origin/main"),
+            &opts,
+        )
+    };
+    let first = add("w1").unwrap();
+    if supported(scratch.path()) {
+        assert!(matches!(first, git_cow::Added::Cloned), "{first:?}");
+    } else {
+        assert!(matches!(first, git_cow::Added::Plain(_)), "{first:?}");
+    }
+    assert!(clean(&scratch.path().join("w1")));
+
+    with_gitmodules(p);
+    match add("w2").unwrap() {
+        git_cow::Added::Plain(why) => assert!(
+            why.to_string().contains("submodules") || !supported(scratch.path()),
+            "{why}"
+        ),
+        other => panic!("expected the plain fallback, got {other:?}"),
+    }
+    assert!(clean(&scratch.path().join("w2")));
+    sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2"]);
+
+    // -b with a branch that exists fails both ways, and nothing is left
+    sh(p, &["branch", "w2-again", "origin/main"]);
+    assert!(add("w2-again").is_err());
+    assert!(!scratch.path().join("w2-again").exists());
+    sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2-again"]);
+}

@@ -82,6 +82,8 @@ git_cow::add_with(repo, checkout, "origin/main", worktree, Some("feat/x"), None,
 
 `git_cow::remove_template(repo, checkout)` removes the extra checkout, its entry in `git worktree list`, and the lock and stamp files next to it. Call it only when no `add` or `warm` on that extra checkout can run.
 
+`git_cow::add_or_plain` takes the arguments of `add_with` and runs `git worktree add` with the same path, branch and commit when cloning fails. It returns `Added::Cloned`, or `Added::Plain` with the reason the clone failed.
+
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 
 ## Benchmarks

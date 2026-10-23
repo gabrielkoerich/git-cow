@@ -464,3 +464,45 @@ pub fn add_with(
     }
     res
 }
+
+/// How [`add_or_plain`] made the worktree
+#[derive(Debug)]
+pub enum Added {
+    /// Cloned from the template
+    Cloned,
+    /// With `git worktree add`, after cloning failed for this reason
+    Plain(io::Error),
+}
+
+/// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
+/// cloning fails. A failed clone leaves nothing behind, so the plain add starts clean
+pub fn add_or_plain(
+    repo: &Path,
+    template: &Path,
+    template_start: &str,
+    wt: &Path,
+    new_branch: Option<&str>,
+    commitish: Option<&str>,
+    opts: &Options,
+) -> io::Result<Added> {
+    let Err(why) = add_with(
+        repo,
+        template,
+        template_start,
+        wt,
+        new_branch,
+        commitish,
+        opts,
+    ) else {
+        return Ok(Added::Cloned);
+    };
+    let wt_s = wt.to_string_lossy();
+    let mut args = vec!["worktree", "add"];
+    if let Some(b) = new_branch {
+        args.extend(["-b", b]);
+    }
+    args.push(&wt_s);
+    args.extend(commitish);
+    git(repo, &args).map_err(|e| err(format!("{e}, after cloning failed: {why}")))?;
+    Ok(Added::Plain(why))
+}

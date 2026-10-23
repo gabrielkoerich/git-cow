@@ -512,3 +512,63 @@ fn extra_checkout_never_carries_the_users_edits_or_untracked_files() {
     );
     assert!(p.join("src/untracked.txt").exists() && p.join("src/.env").exists());
 }
+
+#[test]
+fn cli_warm_interval_setting_decides_when_add_warms() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let wts = scratch.path().join("wts");
+    let add = |name: &str| {
+        let st = Command::new(bin)
+            .args(["add", "-b", name])
+            .arg(wts.join(name))
+            .current_dir(p)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    std::fs::create_dir_all(p.join("out")).unwrap();
+    std::fs::write(p.join("out/one.bin"), "1\n").unwrap();
+    add("w1");
+    std::fs::write(p.join("out/two.bin"), "2\n").unwrap();
+    add("w2");
+    assert!(
+        !wts.join("w2/out/two.bin").exists(),
+        "the default hour keeps the warm-up"
+    );
+    sh(p, &["config", "cow.warmInterval", "0"]);
+    add("w3");
+    assert!(
+        wts.join("w3/out/two.bin").exists(),
+        "an interval of 0 warms every add"
+    );
+}
+
+#[test]
+fn add_recreates_a_template_whose_folder_was_deleted() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    let tpl = scratch.path().join(".git-cow/p");
+    let add = |name: &str| {
+        git_cow::add(
+            p,
+            &tpl,
+            "origin/main",
+            &scratch.path().join(name),
+            Some(name),
+            Some("origin/main"),
+        )
+    };
+    add("t1").unwrap();
+    std::fs::remove_dir_all(&tpl).unwrap();
+    add("t2").expect("a template git still lists but is gone must be made again");
+    assert!(tpl.join(".git").is_file());
+    assert!(clean(&scratch.path().join("t2")));
+}

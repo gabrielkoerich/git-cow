@@ -140,7 +140,9 @@ pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
 /// Probed with one small file, since filesystem names miss mount options like XFS without reflink
 pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     let key = (src_dir.to_path_buf(), dst_dir.to_path_buf());
-    if let Some(known) = PROBES.lock().unwrap().get(&key) {
+    // Held through the probe, since threads probing at once would share its file names
+    let mut probes = PROBES.lock().unwrap();
+    if let Some(known) = probes.get(&key) {
         return *known;
     }
     let id = std::process::id();
@@ -151,7 +153,7 @@ pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
         && clone_into(&src, &into).is_ok();
     let _ = fs::remove_file(&src);
     let _ = fs::remove_dir_all(&into);
-    PROBES.lock().unwrap().insert(key, ok);
+    probes.insert(key, ok);
     ok
 }
 

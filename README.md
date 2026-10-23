@@ -78,7 +78,9 @@ let opts = git_cow::Options { share: vec![".venv".into()], ..Default::default() 
 git_cow::add_with(repo, checkout, "origin/main", worktree, Some("feat/x"), None, &opts)?;
 ```
 
-`Options::from_repo(repo)` returns the options the CLI uses: the defaults plus `cow.share` and `cow.warmInterval` from git config.
+`Options::from_repo(repo)` returns the options the CLI uses: the defaults plus `cow.share` and `cow.warmInterval` from git config. A `warm_interval` of `Duration::MAX` never warms the extra checkout from your checkout, the same as `cow.warmInterval never`.
+
+`git_cow::remove_template(repo, checkout)` removes the extra checkout, its entry in `git worktree list`, and the lock and stamp files next to it. Call it only when no `add` or `warm` on that extra checkout can run.
 
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 

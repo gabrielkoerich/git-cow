@@ -22,7 +22,7 @@ git config ({repo} in a path is replaced by the repository's name):
   cow.root          where worktrees go when <path> is left out (default ~/.worktrees)
   cow.base          where the extra checkout lives (default <worktree's parent>/.git-cow/<repo>)
   cow.share         a hidden directory to share on top of the built-in caches, one per entry
-  cow.warmInterval  how often add refreshes the extra checkout from your checkout: 0, 30m, 1h (default 1h)
+  cow.warmInterval  how often add refreshes the extra checkout from your checkout: 0, 30m, 1h, never (default 1h)
 GIT_COW=0 disables cloning";
 
 fn main() -> ExitCode {

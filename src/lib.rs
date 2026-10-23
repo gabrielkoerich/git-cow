@@ -37,6 +37,7 @@ pub struct Options {
     /// Hidden directories shared like any other ignored directory
     pub share: Vec<String>,
     /// [`add_with`] warms the template from the checkout at most this often, zero means every time
+    /// and `Duration::MAX` never
     pub warm_interval: std::time::Duration,
 }
 
@@ -69,9 +70,12 @@ impl Options {
     }
 }
 
-// "0", "90" (seconds), "30m", "1h"
+// "0", "90" (seconds), "30m", "1h", "never"
 fn parse_interval(v: &str) -> Option<std::time::Duration> {
     let v = v.trim();
+    if v == "never" {
+        return Some(std::time::Duration::MAX);
+    }
     let (n, unit) = match v.strip_suffix('h') {
         Some(n) => (n, 3600),
         None => match v.strip_suffix('m') {
@@ -157,10 +161,15 @@ pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     ok
 }
 
+// A file next to the template, `.<name>.<ext>`
+fn beside(template: &Path, ext: &str) -> PathBuf {
+    let name = template.file_name().unwrap_or_default().to_string_lossy();
+    template.with_file_name(format!(".{name}.{ext}"))
+}
+
 // Held while a template changes, so a clone never sees it half updated, across processes too
 fn lock_template(template: &Path) -> io::Result<File> {
-    let name = template.file_name().unwrap_or_default().to_string_lossy();
-    let file = File::create(template.with_file_name(format!(".{name}.lock")))?;
+    let file = File::create(beside(template, "lock"))?;
     file.lock()?;
     Ok(file)
 }
@@ -259,8 +268,7 @@ fn ignored_dirs(src: &Path, share: &[String]) -> io::Result<Vec<String>> {
 // Swap a clone of each ignored directory of `src` into the template. Loose ignored files stay
 // out, so local secrets such as .env never reach a worktree
 fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()> {
-    let name = template.file_name().unwrap_or_default().to_string_lossy();
-    let staging = template.with_file_name(format!(".{name}.warm"));
+    let staging = beside(template, "warm");
     for dir in ignored_dirs(src, share)? {
         // A directory the template commit tracks is not build output
         if !git(template, &["ls-files", "--", &dir])
@@ -303,10 +311,34 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
     stamp(template)
 }
 
+/// Remove `template`, its registration in `repo`, and the lock, stamp and staging files next to it.
+/// Call it only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would
+/// get a deleted file, and the next caller a new one
+pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
+    if template.parent().is_none_or(|p| !p.exists()) {
+        return Ok(());
+    }
+    let _lock = lock_template(template)?;
+    if template.join(".git").exists() {
+        git(
+            repo,
+            &["worktree", "remove", "--force", &template.to_string_lossy()],
+        )?;
+    }
+    let _ = fs::remove_dir_all(template);
+    let _ = fs::remove_dir_all(beside(template, "warm"));
+    for ext in ["warmed", "lock"] {
+        match fs::remove_file(beside(template, ext)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // Marks when the template was last warmed, so add_with can skip a warm-up it did recently
 fn stamp_path(template: &Path) -> PathBuf {
-    let name = template.file_name().unwrap_or_default().to_string_lossy();
-    template.with_file_name(format!(".{name}.warmed"))
+    beside(template, "warmed")
 }
 
 fn stamp(template: &Path) -> io::Result<()> {
@@ -410,7 +442,8 @@ pub fn add_with(
     }
     // Re-cloning big caches on every add costs seconds, and a template an hour old only means a
     // little more rebuilding. Bare repositories have no ignored files, so nothing changes for them
-    if opts.warm_interval.is_zero() || !warmed_within(template, opts.warm_interval) {
+    let never = opts.warm_interval == std::time::Duration::MAX;
+    if !never && (opts.warm_interval.is_zero() || !warmed_within(template, opts.warm_interval)) {
         let _ = warm_template(repo, template, &opts.share);
         let _ = stamp(template);
     }

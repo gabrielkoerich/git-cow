@@ -57,7 +57,7 @@ All settings are git config, per repository or `--global`. In a path, `{repo}` b
 | `cow.root` | `~/.worktrees` | Where `add` puts a worktree when you give no path: `<root>/<repo>/<branch>`. With `{repo}` in it, `<root>/<branch>` |
 | `cow.base` | `<worktree's parent>/.git-cow/<repo>` | Where the extra checkout lives |
 | `cow.share` | | One extra hidden folder to share, per entry |
-| `cow.warmInterval` | `1h` | How often `add` refreshes the extra checkout from your checkout: `0` (always), `30m`, `2h` |
+| `cow.warmInterval` | `1h` | How often `add` refreshes the extra checkout from your checkout: `0` (always), `30m`, `2h`, `never` |
 | `GIT_COW=0` (environment) | | Turns cloning off |
 
 The extra checkout sits next to the worktree, so tools with different layouts each get their own: `~/.worktrees/<repo>/.git-cow/<repo>` for `git cow add`, `<repo>/.claude/worktrees/.git-cow/<repo>` for Claude Code. Another extra checkout takes almost no disk, but each is refreshed on its own. To share one extra checkout per repository across tools:
@@ -78,7 +78,9 @@ let opts = git_cow::Options { share: vec![".venv".into()], ..Default::default() 
 git_cow::add_with(repo, checkout, "origin/main", worktree, Some("feat/x"), None, &opts)?;
 ```
 
-`Options::from_repo(repo)` returns the options the CLI uses: the defaults plus `cow.share` and `cow.warmInterval` from git config.
+`Options::from_repo(repo)` returns the options the CLI uses: the defaults plus `cow.share` and `cow.warmInterval` from git config. A `warm_interval` of `Duration::MAX` never warms the extra checkout from your checkout, the same as `cow.warmInterval never`.
+
+`git_cow::remove_template(repo, checkout)` removes the extra checkout, its entry in `git worktree list`, and the lock and stamp files next to it. Call it only when no `add` or `warm` on that extra checkout can run.
 
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 

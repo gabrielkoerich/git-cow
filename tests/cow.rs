@@ -715,3 +715,39 @@ fn add_failing_after_git_registered_the_worktree_leaves_nothing() {
         .unwrap();
     assert!(out.stdout.is_empty(), "a failed add left its branch");
 }
+
+#[test]
+fn add_warms_again_once_the_interval_passed() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    let tpl = scratch.path().join(".git-cow/p");
+    let opts = git_cow::Options {
+        warm_interval: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let add = |name: &str| {
+        git_cow::add_with(
+            p,
+            &tpl,
+            "origin/main",
+            &scratch.path().join(name),
+            Some(name),
+            Some("origin/main"),
+            &opts,
+        )
+        .unwrap()
+    };
+    std::fs::create_dir_all(p.join("out")).unwrap();
+    std::fs::write(p.join("out/one.bin"), "1\n").unwrap();
+    add("w1");
+    assert!(scratch.path().join("w1/out/one.bin").exists());
+    std::fs::write(p.join("out/two.bin"), "2\n").unwrap();
+    add("w2");
+    assert!(!scratch.path().join("w2/out/two.bin").exists());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    add("w3");
+    assert!(scratch.path().join("w3/out/two.bin").exists());
+}

@@ -832,3 +832,42 @@ fn remove_template_leaves_nothing_and_add_makes_it_again() {
     add("w2").unwrap();
     assert!(clean(&scratch.path().join("w2")));
 }
+
+// git-cow refuses submodules on every volume, so this fails the clone wherever the test runs
+fn with_gitmodules(p: &Path) {
+    std::fs::write(p.join(".gitmodules"), "").unwrap();
+    sh(p, &["add", ".gitmodules"]);
+    sh(p, &["commit", "-q", "-m", "gitmodules"]);
+    sh(p, &["push", "-q", "origin", "HEAD:main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+}
+
+#[test]
+fn plain_worktree_add_works_after_a_failed_add() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    with_gitmodules(p);
+    let wt = scratch.path().join("w1");
+    let res = git_cow::add(
+        p,
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &wt,
+        Some("w1"),
+        Some("origin/main"),
+    );
+    assert!(res.is_err());
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "w1",
+            wt.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    assert!(clean(&wt));
+}

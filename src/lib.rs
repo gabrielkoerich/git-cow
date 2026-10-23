@@ -173,17 +173,16 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
         return Ok(());
     }
     let _ = fs::remove_dir_all(template);
-    let _ = git(repo, &["worktree", "prune"]);
     if clone_checkout(repo, template, start).is_ok() {
         return Ok(());
     }
     let _ = fs::remove_dir_all(template);
-    let _ = git(repo, &["worktree", "prune"]);
     git(
         repo,
         &[
             "worktree",
             "add",
+            "-f",
             "--detach",
             &template.to_string_lossy(),
             start,
@@ -207,6 +206,7 @@ fn clone_checkout(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
         &[
             "worktree",
             "add",
+            "-f",
             "--no-checkout",
             "--detach",
             &template.to_string_lossy(),
@@ -425,7 +425,6 @@ pub fn add_with(
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
         );
         let _ = fs::remove_dir_all(wt);
-        let _ = git(repo, &["worktree", "prune"]);
         if let Some(b) = ours {
             let _ = git(repo, &["branch", "-D", b]);
         }

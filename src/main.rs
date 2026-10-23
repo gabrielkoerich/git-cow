@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
 
 const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
        git cow list
@@ -68,44 +67,10 @@ fn config_path(repo: &Path, key: &str) -> Option<PathBuf> {
     })
 }
 
-// "0", "90" (seconds), "30m", "1h"
-fn parse_interval(v: &str) -> Option<Duration> {
-    let v = v.trim();
-    let (n, unit) = match v.strip_suffix('h') {
-        Some(n) => (n, 3600),
-        None => match v.strip_suffix('m') {
-            Some(n) => (n, 60),
-            None => (v.strip_suffix('s').unwrap_or(v), 1),
-        },
-    };
-    n.trim()
-        .parse::<u64>()
-        .ok()
-        .map(|n| Duration::from_secs(n * unit))
-}
-
-// The built-in caches plus every cow.share entry, and the warm interval
-fn options(repo: &Path) -> git_cow::Options {
-    let mut opts = git_cow::Options::default();
-    let extra = git_cow::git(repo, &["config", "--get-all", "cow.share"]).unwrap_or_default();
-    for d in extra.lines().map(str::trim).filter(|d| !d.is_empty()) {
-        if !opts.share.iter().any(|l| l == d) {
-            opts.share.push(d.to_string());
-        }
-    }
-    if let Some(i) = git_cow::git(repo, &["config", "--get", "cow.warmInterval"])
-        .ok()
-        .and_then(|v| parse_interval(&v))
-    {
-        opts.warm_interval = i;
-    }
-    opts
-}
-
 fn share(args: &[String]) -> std::io::Result<()> {
     let repo = std::env::current_dir()?;
     let global = args.iter().any(|a| a == "--global");
-    let have = options(&repo).share;
+    let have = git_cow::Options::from_repo(&repo).share;
     for d in args.iter().filter(|a| *a != "--global") {
         if !d.starts_with('.') || d.contains('/') {
             return Err(other(format!(
@@ -118,7 +83,7 @@ fn share(args: &[String]) -> std::io::Result<()> {
         let scope = if global { "--global" } else { "--local" };
         git_cow::git(&repo, &["config", scope, "--add", "cow.share", d])?;
     }
-    for d in options(&repo).share {
+    for d in git_cow::Options::from_repo(&repo).share {
         println!("{d}");
     }
     Ok(())
@@ -219,7 +184,7 @@ fn add(args: &[String]) -> ExitCode {
             &wt,
             new_branch,
             rest.get(1).map(String::as_str),
-            &options(&repo),
+            &git_cow::Options::from_repo(&repo),
         )?;
         println!("{}", wt.display());
         Ok(())
@@ -305,7 +270,7 @@ fn remove(args: &[String]) -> std::io::Result<()> {
     }
     if warm_first {
         let template = template_for(&repo, &wt)?;
-        git_cow::warm_with(&wt, &template, &options(&repo))?;
+        git_cow::warm_with(&wt, &template, &git_cow::Options::from_repo(&repo))?;
     }
     let wt_s = wt.to_string_lossy();
     let mut cmd = vec!["worktree", "remove"];
@@ -324,5 +289,5 @@ fn remove(args: &[String]) -> std::io::Result<()> {
 fn warm(wt: &Path) -> std::io::Result<()> {
     let wt = std::path::absolute(wt)?;
     let template = template_for(&wt, &wt)?;
-    git_cow::warm_with(&wt, &template, &options(&wt))
+    git_cow::warm_with(&wt, &template, &git_cow::Options::from_repo(&wt))
 }

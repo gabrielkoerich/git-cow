@@ -572,3 +572,82 @@ fn add_recreates_a_template_whose_folder_was_deleted() {
     assert!(tpl.join(".git").is_file());
     assert!(clean(&scratch.path().join("t2")));
 }
+
+#[test]
+fn options_from_repo_reads_share_and_warm_interval() {
+    let (_r, project, _scratch) = setup();
+    let p = project.path();
+    let opts = git_cow::Options::from_repo(p);
+    assert_eq!(opts.share, git_cow::Options::default().share);
+    assert_eq!(opts.warm_interval, std::time::Duration::from_secs(3600));
+    sh(p, &["config", "--add", "cow.share", ".venv"]);
+    sh(p, &["config", "--add", "cow.share", ".uv-cache"]);
+    sh(p, &["config", "cow.warmInterval", "30m"]);
+    let opts = git_cow::Options::from_repo(p);
+    assert!(opts.share.iter().any(|s| s == ".venv"));
+    assert_eq!(
+        opts.share.iter().filter(|s| *s == ".uv-cache").count(),
+        1,
+        "a built-in entry is not listed twice"
+    );
+    assert_eq!(opts.warm_interval, std::time::Duration::from_secs(1800));
+}
+
+#[test]
+fn probes_from_many_threads_agree() {
+    let scratch = tempfile::tempdir().unwrap();
+    let expected = supported(scratch.path());
+    for round in 0..30 {
+        let src = scratch.path().join(format!("src-{round}"));
+        std::fs::create_dir_all(&src).unwrap();
+        let results: Vec<bool> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let dst = scratch.path().join(format!("dst-{round}-{i}"));
+                    std::fs::create_dir_all(&dst).unwrap();
+                    let src = &src;
+                    s.spawn(move || git_cow::can_clone(src, &dst))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            results.iter().all(|r| *r == expected),
+            "round {round}: {results:?}, expected all {expected}"
+        );
+    }
+}
+
+#[test]
+fn add_never_prunes_other_worktrees() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    // a worktree on a drive that is not mounted right now
+    let away = scratch.path().join("away");
+    sh(
+        p,
+        &["worktree", "add", "-q", "--detach", away.to_str().unwrap()],
+    );
+    std::fs::rename(&away, scratch.path().join("unmounted")).unwrap();
+    git_cow::add(
+        p,
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &scratch.path().join("t1"),
+        Some("t1"),
+        Some("origin/main"),
+    )
+    .unwrap();
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("/away\n"),
+        "git-cow removed another worktree's registration"
+    );
+}

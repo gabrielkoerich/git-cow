@@ -49,6 +49,42 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    /// The defaults plus every `cow.share` entry and `cow.warmInterval` from `repo`'s git config
+    pub fn from_repo(repo: &Path) -> Options {
+        let mut opts = Options::default();
+        let extra = git(repo, &["config", "--get-all", "cow.share"]).unwrap_or_default();
+        for d in extra.lines().map(str::trim).filter(|d| !d.is_empty()) {
+            if !opts.share.iter().any(|l| l == d) {
+                opts.share.push(d.to_string());
+            }
+        }
+        if let Some(i) = git(repo, &["config", "--get", "cow.warmInterval"])
+            .ok()
+            .and_then(|v| parse_interval(&v))
+        {
+            opts.warm_interval = i;
+        }
+        opts
+    }
+}
+
+// "0", "90" (seconds), "30m", "1h"
+fn parse_interval(v: &str) -> Option<std::time::Duration> {
+    let v = v.trim();
+    let (n, unit) = match v.strip_suffix('h') {
+        Some(n) => (n, 3600),
+        None => match v.strip_suffix('m') {
+            Some(n) => (n, 60),
+            None => (v.strip_suffix('s').unwrap_or(v), 1),
+        },
+    };
+    n.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| std::time::Duration::from_secs(n * unit))
+}
+
 // Clone `src`, a file or a whole directory, to `dst_dir/<its name>` in one call
 #[cfg(target_os = "macos")]
 fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {

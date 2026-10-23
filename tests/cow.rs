@@ -871,3 +871,46 @@ fn plain_worktree_add_works_after_a_failed_add() {
     );
     assert!(clean(&wt));
 }
+
+#[test]
+fn add_or_plain_clones_or_falls_back() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    let tpl = scratch.path().join(".git-cow/p");
+    let opts = git_cow::Options::default();
+    let add = |name: &str| {
+        git_cow::add_or_plain(
+            p,
+            &tpl,
+            "origin/main",
+            &scratch.path().join(name),
+            Some(name),
+            Some("origin/main"),
+            &opts,
+        )
+    };
+    let first = add("w1").unwrap();
+    if supported(scratch.path()) {
+        assert!(matches!(first, git_cow::Added::Cloned), "{first:?}");
+    } else {
+        assert!(matches!(first, git_cow::Added::Plain(_)), "{first:?}");
+    }
+    assert!(clean(&scratch.path().join("w1")));
+
+    with_gitmodules(p);
+    match add("w2").unwrap() {
+        git_cow::Added::Plain(why) => assert!(
+            why.to_string().contains("submodules") || !supported(scratch.path()),
+            "{why}"
+        ),
+        other => panic!("expected the plain fallback, got {other:?}"),
+    }
+    assert!(clean(&scratch.path().join("w2")));
+    sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2"]);
+
+    // -b with a branch that exists fails both ways, and nothing is left
+    sh(p, &["branch", "w2-again", "origin/main"]);
+    assert!(add("w2-again").is_err());
+    assert!(!scratch.path().join("w2-again").exists());
+    sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2-again"]);
+}

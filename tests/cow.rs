@@ -751,3 +751,85 @@ fn add_warms_again_once_the_interval_passed() {
     add("w3");
     assert!(scratch.path().join("w3/out/two.bin").exists());
 }
+
+#[test]
+fn max_interval_never_warms_from_the_checkout() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    std::fs::create_dir_all(p.join("out")).unwrap();
+    std::fs::write(p.join("out/host.bin"), "host\n").unwrap();
+    let never = git_cow::Options {
+        warm_interval: std::time::Duration::MAX,
+        ..Default::default()
+    };
+    let tpl = scratch.path().join(".git-cow/p");
+    let wt = scratch.path().join("w1");
+    git_cow::add_with(
+        p,
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("w1"),
+        Some("origin/main"),
+        &never,
+    )
+    .unwrap();
+    assert!(!tpl.join("out").exists() && !wt.join("out").exists());
+    // an explicit warm still warms
+    git_cow::warm_with(p, &tpl, &never).unwrap();
+    assert!(tpl.join("out/host.bin").exists());
+}
+
+#[test]
+fn warm_interval_never_in_git_config() {
+    let (_r, project, _scratch) = setup();
+    sh(project.path(), &["config", "cow.warmInterval", "never"]);
+    assert_eq!(
+        git_cow::Options::from_repo(project.path()).warm_interval,
+        std::time::Duration::MAX
+    );
+}
+
+#[test]
+fn remove_template_leaves_nothing_and_add_makes_it_again() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    let dir = scratch.path().join(".git-cow");
+    let tpl = dir.join("p");
+    let add = |name: &str| {
+        git_cow::add(
+            p,
+            &tpl,
+            "origin/main",
+            &scratch.path().join(name),
+            Some(name),
+            Some("origin/main"),
+        )
+    };
+    add("w1").unwrap();
+    git_cow::remove_template(p, &tpl).unwrap();
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("/.git-cow/p\n"));
+    assert!(
+        clean(&scratch.path().join("w1")),
+        "a worktree made from it stays"
+    );
+    git_cow::remove_template(p, &tpl).expect("removing it twice is fine");
+    add("w2").unwrap();
+    assert!(clean(&scratch.path().join("w2")));
+}

@@ -49,6 +49,42 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    /// The defaults plus every `cow.share` entry and `cow.warmInterval` from `repo`'s git config
+    pub fn from_repo(repo: &Path) -> Options {
+        let mut opts = Options::default();
+        let extra = git(repo, &["config", "--get-all", "cow.share"]).unwrap_or_default();
+        for d in extra.lines().map(str::trim).filter(|d| !d.is_empty()) {
+            if !opts.share.iter().any(|l| l == d) {
+                opts.share.push(d.to_string());
+            }
+        }
+        if let Some(i) = git(repo, &["config", "--get", "cow.warmInterval"])
+            .ok()
+            .and_then(|v| parse_interval(&v))
+        {
+            opts.warm_interval = i;
+        }
+        opts
+    }
+}
+
+// "0", "90" (seconds), "30m", "1h"
+fn parse_interval(v: &str) -> Option<std::time::Duration> {
+    let v = v.trim();
+    let (n, unit) = match v.strip_suffix('h') {
+        Some(n) => (n, 3600),
+        None => match v.strip_suffix('m') {
+            Some(n) => (n, 60),
+            None => (v.strip_suffix('s').unwrap_or(v), 1),
+        },
+    };
+    n.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| std::time::Duration::from_secs(n * unit))
+}
+
 // Clone `src`, a file or a whole directory, to `dst_dir/<its name>` in one call
 #[cfg(target_os = "macos")]
 fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
@@ -104,7 +140,9 @@ pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
 /// Probed with one small file, since filesystem names miss mount options like XFS without reflink
 pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     let key = (src_dir.to_path_buf(), dst_dir.to_path_buf());
-    if let Some(known) = PROBES.lock().unwrap().get(&key) {
+    // Held through the probe, since threads probing at once would share its file names
+    let mut probes = PROBES.lock().unwrap();
+    if let Some(known) = probes.get(&key) {
         return *known;
     }
     let id = std::process::id();
@@ -115,7 +153,7 @@ pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
         && clone_into(&src, &into).is_ok();
     let _ = fs::remove_file(&src);
     let _ = fs::remove_dir_all(&into);
-    PROBES.lock().unwrap().insert(key, ok);
+    probes.insert(key, ok);
     ok
 }
 
@@ -135,17 +173,16 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
         return Ok(());
     }
     let _ = fs::remove_dir_all(template);
-    let _ = git(repo, &["worktree", "prune"]);
     if clone_checkout(repo, template, start).is_ok() {
         return Ok(());
     }
     let _ = fs::remove_dir_all(template);
-    let _ = git(repo, &["worktree", "prune"]);
     git(
         repo,
         &[
             "worktree",
             "add",
+            "-f",
             "--detach",
             &template.to_string_lossy(),
             start,
@@ -169,6 +206,7 @@ fn clone_checkout(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
         &[
             "worktree",
             "add",
+            "-f",
             "--no-checkout",
             "--detach",
             &template.to_string_lossy(),
@@ -387,7 +425,6 @@ pub fn add_with(
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
         );
         let _ = fs::remove_dir_all(wt);
-        let _ = git(repo, &["worktree", "prune"]);
         if let Some(b) = ours {
             let _ = git(repo, &["branch", "-D", b]);
         }

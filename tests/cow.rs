@@ -1651,7 +1651,7 @@ fn force_never_replaces_a_bare_repository() {
 
 // The lock file next to a path shows git-cow made a template there, so what is left of it is rebuilt
 #[test]
-fn a_template_left_without_git_is_rebuilt() {
+fn a_folder_with_a_stale_lock_needs_force() {
     let (_r, project, scratch) = setup();
     if !supported(scratch.path()) {
         return;
@@ -1660,9 +1660,25 @@ fn a_template_left_without_git_is_rebuilt() {
     std::fs::create_dir_all(tpl.join("src")).unwrap();
     std::fs::write(tpl.join("src/half.txt"), "x").unwrap();
     std::fs::write(scratch.path().join(".git-cow/.p.lock"), "").unwrap();
+    // the lock outlives the template, so beside a folder with no `.git` it proves nothing
     let wt = scratch.path().join("wt");
-    git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None)
-        .expect("a leftover of git-cow's own template is rebuilt");
+    let res = git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None);
+    assert!(
+        res.is_err(),
+        "a stale lock let git-cow take a folder of files"
+    );
+    assert!(git_cow::remove_template(project.path(), &tpl).is_err());
+    assert!(tpl.join("src/half.txt").exists());
+    git_cow::add_with(
+        project.path(),
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("wt"),
+        None,
+        &forced(),
+    )
+    .expect("--force replaces it");
     assert!(!tpl.join("src/half.txt").exists());
     assert!(clean(&wt));
 }
@@ -1903,8 +1919,39 @@ fn a_worktree_in_a_rebase_is_never_a_template() {
         .output()
         .unwrap();
     let gitdir = std::path::PathBuf::from(String::from_utf8_lossy(&gitdir.stdout).trim());
-    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
     std::fs::write(scratch.path().join(".git-cow/.p.lock"), "").unwrap();
+    for marker in [
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "MERGE_HEAD",
+        "BISECT_LOG",
+    ] {
+        std::fs::write(gitdir.join(marker), "").unwrap();
+        let res = git_cow::add(
+            project.path(),
+            &tpl,
+            "origin/main",
+            &scratch.path().join("wt"),
+            Some("wt"),
+            None,
+        );
+        assert!(res.is_err(), "{marker} in progress");
+        std::fs::remove_file(gitdir.join(marker)).unwrap();
+    }
+    for marker in ["sequencer", "rebase-apply"] {
+        std::fs::create_dir(gitdir.join(marker)).unwrap();
+        let res = git_cow::add(
+            project.path(),
+            &tpl,
+            "origin/main",
+            &scratch.path().join("wt"),
+            Some("wt"),
+            None,
+        );
+        assert!(res.is_err(), "{marker} in progress");
+        std::fs::remove_dir(gitdir.join(marker)).unwrap();
+    }
+    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
     let res = git_cow::add(
         project.path(),
         &tpl,
@@ -1991,5 +2038,33 @@ fn warm_never_writes_through_a_symlink_out_of_the_template() {
     assert_eq!(
         std::fs::read_to_string(victim.join("sub/keep")).unwrap(),
         "keep\n"
+    );
+}
+
+// git-cow's git calls run on its own paths, never on a repository an inherited GIT_DIR or index names
+#[test]
+fn cli_ignores_an_inherited_git_index() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    std::fs::write(p.join("staged.txt"), "s\n").unwrap();
+    sh(p, &["add", "staged.txt"]);
+    let index = p.join(".git/index");
+    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(["add", "-b", "env"])
+        .arg(scratch.path().join("env"))
+        .env("GIT_INDEX_FILE", &index)
+        .current_dir(p)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "staged.txt",
+        "the user's index changed"
     );
 }

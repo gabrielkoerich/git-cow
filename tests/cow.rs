@@ -2594,8 +2594,7 @@ fn tree_never_runs_a_repository_filter() {
     assert!(!marker.exists(), "tree ran the repository's clean filter");
 }
 
-fn spy(dir: &Path, marker: &Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+fn spy(dir: &Path, marker: &Path) -> PathBuf {
     let script = dir.join("spy.sh");
     std::fs::write(
         &script,
@@ -2639,7 +2638,7 @@ fn cleanup_needs_the_branch_files_in_the_base() {
     let (_r, project, _s) = setup();
     let p = project.path();
     let block = "c1\nc2\nc3\nk\nc4\nc5\nc6\n";
-    let filler: String = (1..=10).map(|i| format!("f{i}\n")).collect();
+    let filler = "f1\nf2\nf3\nf4\nf5\nf6\nf7\nf8\nf9\nf10\n";
     std::fs::write(p.join("b.txt"), format!("{block}{filler}{block}")).unwrap();
     sh(p, &["add", "b.txt"]);
     sh(p, &["commit", "-q", "-m", "blocks"]);

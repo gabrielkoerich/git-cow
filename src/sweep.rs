@@ -9,9 +9,26 @@ use git_cow::REPO_ENV;
 
 use crate::{is_template, other};
 
-// Ahead of every git call here: no fsmonitor program from a repository's own config, and no index
-// refresh written back. `git status` can still run a clean filter, so only cleanup calls it
-const QUIET: &[&str] = &["-c", "core.fsmonitor=false", "--no-optional-locks"];
+// Ahead of every git call here: no fsmonitor or gpg program from a repository's own config, and
+// no index refresh written back. `git status` can still run a clean filter, so only cleanup does
+const QUIET: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "log.showSignature=false",
+    "--no-optional-locks",
+];
+
+// Files a rebase, merge, bisect, cherry-pick or revert in progress leaves in a worktree's gitdir
+const BUSY: &[&str] = &[
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "BISECT_LOG",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "sequencer",
+];
 
 // Diffs compared byte for byte, without a diff program or textconv filter a repository may set
 const DIFF: &[&str] = &[
@@ -27,6 +44,8 @@ fn git_cmd(dir: &Path) -> Command {
     for var in REPO_ENV {
         cmd.env_remove(var);
     }
+    // a partial clone would fetch a missing blob, through ssh or a credential helper
+    cmd.env("GIT_NO_LAZY_FETCH", "1");
     cmd.arg("-C").arg(dir).args(QUIET);
     cmd
 }
@@ -174,7 +193,7 @@ fn base(repo: &Path, named: Option<&str>) -> io::Result<Base> {
             continue;
         };
         let local = if let Some(rest) = full.strip_prefix("refs/remotes/") {
-            rest.split_once('/').map(|(_, b)| b.to_string())
+            remote_branch(repo, rest)
         } else {
             full.strip_prefix("refs/heads/").map(String::from)
         };
@@ -190,9 +209,61 @@ fn base(repo: &Path, named: Option<&str>) -> io::Result<Base> {
     ))
 }
 
-// The patch id of everything `rev` changed since its merge base with the base, and the base
-// commits after that merge base. None for an ancestor, or a rev that changes nothing in total
-fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<(String, String)> {
+// The branch in `<remote>/<branch>`, taking the longest remote name that fits, since a remote name
+// may hold a slash
+fn remote_branch(repo: &Path, rest: &str) -> Option<String> {
+    let remotes = run(repo, &["remote"]).unwrap_or_default();
+    remotes
+        .lines()
+        .filter_map(|r| {
+            rest.strip_prefix(r)
+                .and_then(|b| b.strip_prefix('/'))
+                .map(|b| (r.len(), b))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, b)| b.to_string())
+        .or_else(|| rest.split_once('/').map(|(_, b)| b.to_string()))
+}
+
+// In a partial clone reading a branch's blobs would fetch them, so only ancestry counts there
+fn is_partial(repo: &Path) -> bool {
+    run(repo, &["config", "--get", "extensions.partialClone"]).is_ok()
+        || run(repo, &["config", "--get-regexp", r"^remote\..*\.promisor$"])
+            .is_ok_and(|o| o.lines().any(|l| l.ends_with(" true")))
+}
+
+// The files `rev` changed since `mb` hold the same content in the base, so a patch match is not
+// the same edit in another place of a file, or a squash the base reverted later
+fn files_match(repo: &Path, base: &str, mb: &str, rev: &str) -> bool {
+    let Ok(out) = git_cmd(repo)
+        .args(["diff", "--name-only", "-z", "--no-renames", mb, rev])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let names = String::from_utf8_lossy(&out.stdout).into_owned();
+    let paths: Vec<&str> = names.split('\0').filter(|p| !p.is_empty()).collect();
+    if !out.status.success() || paths.is_empty() {
+        return false;
+    }
+    let mut args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--quiet",
+        "--no-ext-diff",
+        "--no-textconv",
+        base,
+        rev,
+        "--",
+    ];
+    args.extend(paths);
+    run(repo, &args).is_ok()
+}
+
+// The patch id of everything `rev` changed since its merge base with the base, the base commits
+// after that merge base, and the merge base. None for an ancestor, or a rev that changes nothing
+fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<(String, String, String)> {
     if run(repo, &["merge-base", "--is-ancestor", rev, base]).is_ok() {
         return None;
     }
@@ -203,7 +274,7 @@ fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<(String, String)> 
     let own = patch_ids(repo, &args, None).ok()?;
     let own = own.split_whitespace().next()?.to_string();
     let commits = run(repo, &["rev-list", "--no-merges", base, &format!("^{mb}")]).ok()?;
-    Some((own, commits))
+    Some((own, commits, mb))
 }
 
 // Patch ids of `commits`, all in one `git log`. An empty commit has none, so it matches nothing
@@ -238,14 +309,21 @@ fn commit_patch_ids(repo: &Path, commits: &HashSet<&str>) -> HashMap<String, Str
 // Merged is an ancestor of the base. Squashed is git-extras' check with whitespace counted: the
 // whole change since the merge base has the patch id of one base commit after it
 fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<State> {
-    let probes: Vec<Option<(String, String)>> = revs
+    let partial = is_partial(repo);
+    let probes: Vec<Option<(String, String, String)>> = revs
         .iter()
-        .map(|(rev, _)| squash_probe(repo, &base.oid, rev))
+        .map(|(rev, _)| {
+            if partial {
+                None
+            } else {
+                squash_probe(repo, &base.oid, rev)
+            }
+        })
         .collect();
     let wanted: HashSet<&str> = probes
         .iter()
         .flatten()
-        .flat_map(|(_, commits)| commits.lines())
+        .flat_map(|(_, commits, _)| commits.lines())
         .collect();
     let by_commit = commit_patch_ids(repo, &wanted);
     revs.iter()
@@ -254,10 +332,11 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
             if run(repo, &["merge-base", "--is-ancestor", rev, &base.oid]).is_ok() {
                 return State::Merged;
             }
-            let squashed = probe.as_ref().is_some_and(|(own, commits)| {
+            let squashed = probe.as_ref().is_some_and(|(own, commits, mb)| {
                 commits
                     .lines()
                     .any(|c| by_commit.get(c).is_some_and(|pid| pid == own))
+                    && files_match(repo, &base.oid, mb, rev)
             });
             if squashed {
                 return State::Squashed;
@@ -278,19 +357,90 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
         .collect()
 }
 
-// Edits, staged changes and every untracked file, whatever status.showUntrackedFiles says
+// Edits, staged changes and every untracked file, whatever status.showUntrackedFiles says, and
+// files marked assume-unchanged or skip-worktree, whose edits git status hides
 fn has_changes(path: &Path) -> bool {
-    path.exists()
-        && run(
-            path,
-            &[
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-            ],
-        )
-        .is_ok_and(|s| !s.is_empty())
+    if !path.exists() {
+        return false;
+    }
+    let status = run(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+    .is_ok_and(|s| !s.is_empty());
+    let hidden = run(path, &["ls-files", "-v"]).is_ok_and(|s| {
+        s.lines()
+            .any(|l| l.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
+    });
+    status || hidden
+}
+
+// What a worktree holds that git keeps nowhere else: submodule repositories, refs of its own, and
+// a rebase, merge or bisect in progress
+fn own_state(path: &Path) -> Option<&'static str> {
+    if !path.exists() {
+        return None;
+    }
+    let submodules = path.join(".gitmodules").exists()
+        || run(path, &["ls-files", "-s"]).is_ok_and(|s| s.lines().any(|l| l.starts_with("160000")));
+    if submodules {
+        return Some("has submodules");
+    }
+    let Ok(gitdir) = run(path, &["rev-parse", "--absolute-git-dir"]) else {
+        return Some("unreadable");
+    };
+    if BUSY.iter().any(|f| Path::new(&gitdir).join(f).exists()) {
+        return Some("in a rebase, merge or bisect");
+    }
+    if run(path, &["for-each-ref", "refs/worktree/", "refs/bisect/"]).is_ok_and(|s| !s.is_empty()) {
+        return Some("has its own refs");
+    }
+    None
+}
+
+// Claude Code removes its own worktrees, and a session may still run in one
+fn claude_worktree(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    parts
+        .windows(2)
+        .any(|w| w[0] == ".claude" && w[1] == "worktrees")
+}
+
+// Branches a rebase or bisect in any worktree works on, which git lists as detached
+fn busy_branches(repo: &Path) -> HashSet<String> {
+    let mut busy = HashSet::new();
+    let Ok(common) = run(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return busy;
+    };
+    let common = PathBuf::from(common);
+    let mut gitdirs = vec![common.clone()];
+    if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+        gitdirs.extend(entries.flatten().map(|e| e.path()));
+    }
+    for g in gitdirs {
+        for f in [
+            "rebase-merge/head-name",
+            "rebase-apply/head-name",
+            "BISECT_START",
+        ] {
+            if let Ok(text) = std::fs::read_to_string(g.join(f)) {
+                let name = text.trim();
+                busy.insert(name.strip_prefix("refs/heads/").unwrap_or(name).to_string());
+            }
+        }
+    }
+    busy
 }
 
 fn rev_of(w: &Worktree) -> (String, Option<String>) {
@@ -350,8 +500,14 @@ fn worktree_items(
             Action::Keep("locked")
         } else if inside {
             Action::Keep("you are in it")
+        } else if claude_worktree(&wt.path) {
+            Action::Keep("Claude Code worktree")
         } else if wt.branch.as_ref().is_some_and(|b| protected.contains(b)) {
             Action::Keep("base branch")
+        } else if !wt.path.exists() && force == Force::No {
+            Action::Keep("folder missing")
+        } else if let Some(why) = own_state(&wt.path) {
+            Action::Keep(why)
         } else if changes && force == Force::No {
             Action::Keep("has changes")
         } else {
@@ -398,7 +554,11 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
     let here = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut protected: HashSet<String> = base.local.iter().cloned().collect();
     protected.extend(main.branch);
-    protected.extend(run(&repo, &["symbolic-ref", "-q", "--short", "HEAD"]).ok());
+    protected.extend(head_branch(&repo));
+    if named.is_some() {
+        protected.extend(base_of(&repo));
+    }
+    protected.extend(busy_branches(&repo));
     let linked: Vec<Worktree> = linked
         .into_iter()
         .filter(|w| !is_template(&repo, &w.path))
@@ -444,6 +604,18 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
     Ok(Plan { repo, base, items })
 }
 
+// The branch HEAD names in `dir`, from the full ref so a tag with the same name cannot shorten it
+fn head_branch(dir: &Path) -> Option<String> {
+    run(dir, &["symbolic-ref", "-q", "HEAD"])
+        .ok()
+        .and_then(|h| h.strip_prefix("refs/heads/").map(String::from))
+}
+
+// The local default branch, kept even when cleanup compares with another one
+fn base_of(repo: &Path) -> Option<String> {
+    base(repo, None).ok().and_then(|b| b.local)
+}
+
 // One tab separated line: what happens, how far the work landed, the branch, the worktree path
 fn line(item: &Item) -> String {
     let verb = match (&item.action, &item.path) {
@@ -475,7 +647,7 @@ fn unchanged(item: &Item, path: &Path) -> bool {
         return true;
     }
     let head = run(path, &["rev-parse", "HEAD"]).unwrap_or_default();
-    let branch = run(path, &["symbolic-ref", "-q", "--short", "HEAD"]).ok();
+    let branch = head_branch(path);
     head == item.oid && branch == item.branch && (item.forced == Force::Yes || !has_changes(path))
 }
 
@@ -489,7 +661,15 @@ fn delete_branch(repo: &Path, b: &str, oid: &str) -> io::Result<()> {
     {
         return Err(other(format!("{b} is checked out in a worktree")));
     }
+    if busy_branches(repo).contains(b) {
+        return Err(other(format!("a rebase or bisect works on {b}")));
+    }
     run(repo, &["update-ref", "-d", &format!("refs/heads/{b}"), oid])?;
+    // git branch -D drops these too
+    let _ = run(
+        repo,
+        &["config", "--remove-section", &format!("branch.{b}")],
+    );
     Ok(())
 }
 
@@ -588,7 +768,13 @@ pub(crate) fn cleanup(args: &[String]) -> io::Result<()> {
     }
     let worktrees = removals.iter().filter(|i| i.path.is_some()).count();
     let branches = removals.iter().filter(|i| i.branch_too).count();
-    println!("{worktrees} worktrees and {branches} local branches to remove, {against}");
+    let wt_noun = if worktrees == 1 {
+        "worktree"
+    } else {
+        "worktrees"
+    };
+    let br_noun = if branches == 1 { "branch" } else { "branches" };
+    println!("{worktrees} {wt_noun} and {branches} local {br_noun} to remove, {against}");
     if !confirm(&mode)? {
         return Ok(());
     }
@@ -604,7 +790,9 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0)];
     while let Some((d, depth)) = stack.pop() {
-        if d.join(".git").is_dir() {
+        let bare =
+            d.join("HEAD").is_file() && d.join("objects").is_dir() && d.join("refs").is_dir();
+        if d.join(".git").is_dir() || bare {
             found.push(d);
             continue;
         }

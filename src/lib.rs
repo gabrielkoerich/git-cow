@@ -353,6 +353,30 @@ fn warmed_within(template: &Path, interval: std::time::Duration) -> bool {
         .is_some_and(|age| age < interval)
 }
 
+/// The error inside the [`io::ErrorKind::AlreadyExists`] that [`add_with`] returns for a `wt` that
+/// exists and is not empty. Test for it with [`is_occupied`]
+#[derive(Debug)]
+pub struct Occupied(pub PathBuf);
+
+impl std::fmt::Display for Occupied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' already exists", self.0.display())
+    }
+}
+
+impl std::error::Error for Occupied {}
+
+/// Whether `e` is [`add_with`] refusing a `wt` that exists and is not empty, where a plain
+/// `git worktree add` would fail too
+pub fn is_occupied(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Occupied>())
+}
+
+// `b` if no branch has that name yet, so a failed add may delete it
+fn new_branch_name<'a>(repo: &Path, b: Option<&'a str>) -> Option<&'a str> {
+    b.filter(|b| git(repo, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_err())
+}
+
 // Something git worktree add refuses: anything but a missing path or an empty directory
 fn occupied(wt: &Path) -> bool {
     match fs::symlink_metadata(wt) {
@@ -387,7 +411,7 @@ fn populate(template: &Path, wt: &Path) -> io::Result<()> {
 
 /// Create `wt` by cloning `template`, refreshed to `template_start` and warmed from `repo` first.
 /// `new_branch` and `commitish` are `git worktree add`'s. Like it, refuses a `wt` that exists and
-/// is not empty, and on error leaves nothing behind that this call created
+/// is not empty, and on error removes only the worktree and branch this call created
 pub fn add(
     repo: &Path,
     template: &Path,
@@ -420,7 +444,7 @@ pub fn add_with(
     if occupied(wt) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("'{}' already exists", wt.display()),
+            Occupied(wt.to_path_buf()),
         ));
     }
     let wt_parent = wt
@@ -450,10 +474,9 @@ pub fn add_with(
     }
 
     // Only a branch this call creates may be removed on failure, never one that was there before
-    let ours = new_branch
-        .filter(|b| git(repo, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_err());
+    let ours = new_branch_name(repo, new_branch);
     // --no-checkout creates the gitdir entry and the `.git` file, so git state stays per worktree.
-    // Until it succeeds `wt` is not ours, so a failure here must not clean it up
+    // Until it succeeds `wt` is not ours, so a failure here only drops the branch git made first
     let wt_s = wt.to_string_lossy();
     let mut args = vec!["worktree", "add", "--no-checkout"];
     if let Some(b) = new_branch {
@@ -462,7 +485,12 @@ pub fn add_with(
     args.push(&wt_s);
     args.extend(commitish);
     let was_dir = wt.is_dir();
-    git(repo, &args)?;
+    if let Err(e) = git(repo, &args) {
+        if let Some(b) = ours {
+            let _ = git(repo, &["branch", "-D", b]);
+        }
+        return Err(e);
+    }
     let res = populate(template, wt);
     if res.is_err() {
         let _ = git(
@@ -491,7 +519,7 @@ pub enum Added {
 
 /// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
 /// cloning fails. A failed clone leaves nothing behind, so the plain add starts clean. A `wt` that
-/// exists and is not empty fails with [`io::ErrorKind::AlreadyExists`] and no plain add
+/// exists and is not empty fails with [`Occupied`] and no plain add
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,
@@ -512,8 +540,7 @@ pub fn add_or_plain(
     ) else {
         return Ok(Added::Cloned);
     };
-    // git worktree add would refuse the path too, after creating the branch
-    if why.kind() == io::ErrorKind::AlreadyExists {
+    if is_occupied(&why) {
         return Err(why);
     }
 
@@ -524,6 +551,13 @@ pub fn add_or_plain(
     }
     args.push(&wt_s);
     args.extend(commitish);
-    git(repo, &args).map_err(|e| err(format!("{e}, after cloning failed: {why}")))?;
+    let ours = new_branch_name(repo, new_branch);
+    if let Err(e) = git(repo, &args) {
+        // git creates the branch before it checks the path
+        if let Some(b) = ours {
+            let _ = git(repo, &["branch", "-D", b]);
+        }
+        return Err(err(format!("{e}, after cloning failed: {why}")));
+    }
     Ok(Added::Plain(why))
 }

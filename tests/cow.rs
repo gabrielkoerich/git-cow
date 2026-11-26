@@ -1137,3 +1137,89 @@ fn add_or_plain_falls_back_when_the_template_parent_is_a_file() {
     );
     assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
 }
+
+// A template path that git-cow did not make must never be reset, cleaned or deleted
+#[test]
+fn add_never_takes_over_a_template_path_it_did_not_make() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    std::fs::write(p.join("a.txt"), "edited\n").unwrap();
+    let user_wt = scratch.path().join("mine");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "mine",
+            user_wt.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(user_wt.join("a.txt"), "mine\n").unwrap();
+    let dir = scratch.path().join("notes");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("n.md"), "notes\n").unwrap();
+
+    for (i, tpl) in [p.to_path_buf(), user_wt.clone(), dir.clone()]
+        .iter()
+        .enumerate()
+    {
+        let wt = scratch.path().join(format!("wt-{i}"));
+        let b = format!("b-{i}");
+        let res = git_cow::add(p, tpl, "origin/main", &wt, Some(&b), None);
+        assert!(res.is_err(), "{} is not a template", tpl.display());
+        assert!(!wt.exists());
+        assert!(
+            git_cow::warm_with(p, tpl, &git_cow::Options::default()).is_err(),
+            "warm into {}",
+            tpl.display()
+        );
+        assert!(
+            git_cow::remove_template(p, tpl).is_err(),
+            "remove {}",
+            tpl.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(p.join("a.txt")).unwrap(),
+        "edited\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(user_wt.join("a.txt")).unwrap(),
+        "mine\n"
+    );
+    sh(&user_wt, &["symbolic-ref", "-q", "HEAD"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("n.md")).unwrap(),
+        "notes\n"
+    );
+}
+
+// A template from before the marker is a clean detached worktree, and stays usable
+#[test]
+fn add_adopts_a_clean_detached_template_without_a_marker() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let tpl = scratch.path().join(".git-cow/p");
+    sh(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            tpl.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    let wt = scratch.path().join("wt");
+    git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None)
+        .expect("an old template is adopted");
+    assert!(clean(&wt));
+}

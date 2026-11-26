@@ -42,7 +42,7 @@ git cow --help
 
 If `cargo` is missing, or the install fails, stop and tell the user. Do not create the worktree another way.
 
-If the disk cannot clone files, or the repository has submodules, `git cow` still does the work. You still call `git cow` only.
+If the disk cannot clone files, or the repository has submodules, `git cow` still does the work. You still call `git cow` only. Any other error stops `git cow add`. Stop and tell the user, with the error.
 
 ## Where it goes
 
@@ -98,7 +98,7 @@ git cow add "$path" "$branch"
 
 Pass a path outside `~/.worktrees/<project>/` only when the user named one, or when the branch is already under `<project>/.claude/worktrees`. If the path exists, stop and tell the user. Do not add a numeric suffix.
 
-`-b` is the only flag `add` handles. Any other flag skips the clone.
+`add` handles `-b` and `-f`. Any other flag skips the clone. `-f` is `git worktree add --force`, and it also deletes a folder of files at the extra checkout path. Never pass `-f` unless the user asked for it. If `git cow add` refuses the extra checkout path, stop and tell the user, with the error.
 
 ## Remove
 

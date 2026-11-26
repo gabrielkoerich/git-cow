@@ -203,7 +203,16 @@ fn add(args: &[String]) -> ExitCode {
         // a plain worktree would hide that git-cow is not cloning, so only an unsupported clone
         // falls back and any other error is the user's to fix
         Err(e) if !git_cow::is_unsupported(&e) => {
-            eprintln!("git-cow: {e}");
+            let hint = match e
+                .get_ref()
+                .and_then(|i| i.downcast_ref::<git_cow::Foreign>())
+            {
+                Some(git_cow::Foreign::Files(_)) => ". Run git cow add --force to replace it",
+                Some(_) => ". Set cow.base to another path",
+                None if git_cow::is_occupied(&e) => "",
+                None => ". GIT_COW=0 git cow add makes it with git worktree add instead",
+            };
+            eprintln!("git-cow: {e}{hint}");
             ExitCode::FAILURE
         }
         Err(e) => {

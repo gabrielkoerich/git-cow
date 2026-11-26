@@ -227,8 +227,9 @@ fn made_by_git_cow(template: &Path) -> bool {
 
 /// A template path that is not a git-cow extra checkout, inside the `io::Error` that [`add_with`],
 /// [`warm_with`] and [`remove_template`] return. They leave it alone, and only [`Options::force`]
-/// replaces [`Foreign::Files`]
+/// in [`add_with`] replaces [`Foreign::Files`]. The message names the path, the advice is the caller's
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Foreign {
     /// A file, or a directory with files outside git
     Files(PathBuf),
@@ -252,12 +253,11 @@ pub enum Foreign {
 
 impl std::fmt::Display for Foreign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let elsewhere =
-            "so git-cow never uses it as its extra checkout. Set cow.base to another path";
+        let elsewhere = "so git-cow never uses it as its extra checkout";
         match self {
             Foreign::Files(p) => write!(
                 f,
-                "'{}' holds files and is not a git-cow extra checkout, so it is left alone. Use --force to replace it",
+                "'{}' holds files and is not a git-cow extra checkout, so it is left alone",
                 p.display()
             ),
             Foreign::Checkout(p) => write!(f, "'{}' is a main checkout, {elsewhere}", p.display()),
@@ -567,8 +567,9 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
 }
 
 /// Remove `template`, its registration in `repo`, and the lock, stamp and staging files next to it.
-/// Call it only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would
-/// get a deleted file, and the next caller a new one
+/// A path that is not an extra checkout git-cow made fails with [`Foreign`] and stays. Call it
+/// only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would get a
+/// deleted file, and the next caller a new one
 pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     let template = &absolute(template)?;
     if template.parent().is_none_or(|p| !p.exists()) {

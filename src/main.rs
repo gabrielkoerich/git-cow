@@ -200,17 +200,15 @@ fn add(args: &[String]) -> ExitCode {
     });
     match res {
         Ok(()) => ExitCode::SUCCESS,
-        // a plain worktree would hide that git-cow is not cloning, so only an unsupported clone
-        // falls back and any other error is the user's to fix
-        Err(e) if !git_cow::is_unsupported(&e) => {
+        // a path git-cow leaves alone needs the user, any clone error still makes the worktree
+        Err(e) if git_cow::is_refused(&e) => {
             let hint = match e
                 .get_ref()
                 .and_then(|i| i.downcast_ref::<git_cow::Foreign>())
             {
                 Some(git_cow::Foreign::Files(_)) => ". Run git cow add --force to replace it",
                 Some(_) => ". Set cow.base to another path",
-                None if git_cow::is_occupied(&e) => "",
-                None => ". GIT_COW=0 git cow add makes it with git worktree add instead",
+                None => "",
             };
             eprintln!("git-cow: {e}{hint}");
             ExitCode::FAILURE
@@ -231,7 +229,14 @@ fn add(args: &[String]) -> ExitCode {
                 )
                 .is_err()
             });
-            let code = plain(&git_args, &e.to_string());
+            let why = if git_cow::is_unsupported(&e) {
+                e.to_string()
+            } else {
+                format!(
+                    "warning: cloning failed ({e}), so this worktree is not a copy-on-write clone"
+                )
+            };
+            let code = plain(&git_args, &why);
             // git creates the branch before it checks the path
             if code != ExitCode::SUCCESS
                 && let Some(b) = &ours

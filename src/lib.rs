@@ -656,10 +656,17 @@ impl std::fmt::Display for Unsupported {
 
 impl std::error::Error for Unsupported {}
 
-/// Whether `e` is [`Unsupported`], the one error after which a plain `git worktree add` runs.
-/// Any other error is for the user to fix, so a plain worktree never hides it
+/// Whether `e` is [`Unsupported`], where a plain `git worktree add` is expected. Any other clone
+/// error also falls back in [`add_or_plain`], and a caller may warn that cloning failed
 pub fn is_unsupported(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Unsupported>())
+}
+
+/// Whether `e` is [`Occupied`] or [`Foreign`], a path git-cow leaves alone. A plain
+/// `git worktree add` must not run instead, since the path needs the user first
+pub fn is_refused(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<Occupied>() || inner.is::<Foreign>())
 }
 
 // The branch git worktree add creates if none has its name yet, so a failed add may delete it:
@@ -834,12 +841,12 @@ pub fn add_with(
 pub enum Added {
     /// Cloned from the template
     Cloned,
-    /// With `git worktree add`, since cloning is [`Unsupported`] for this reason
+    /// With `git worktree add`, since cloning failed for this reason, [`Unsupported`] or not
     Plain(io::Error),
 }
 
 /// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
-/// cloning is [`Unsupported`]. Any other error is returned with no plain add
+/// cloning fails. A path [`is_refused`] is returned with no plain add
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,
@@ -861,7 +868,7 @@ pub fn add_or_plain(
     ) else {
         return Ok(Added::Cloned);
     };
-    if !is_unsupported(&why) {
+    if is_refused(&why) {
         return Err(why);
     }
 

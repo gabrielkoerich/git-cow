@@ -42,7 +42,7 @@ git cow --help
 
 If `cargo` is missing, or the install fails, stop and tell the user. Do not create the worktree another way.
 
-If the disk cannot clone files, or the repository has submodules, `git cow` still does the work. You still call `git cow` only. Any other error stops `git cow add`. Stop and tell the user, with the error.
+If the disk cannot clone files, or the repository has submodules, `git cow` still does the work. You still call `git cow` only. If `git cow add` prints a warning that cloning failed, the worktree is still made. Tell the user the warning.
 
 ## Where it goes
 

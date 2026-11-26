@@ -1302,7 +1302,23 @@ fn cli_refusal_names_force_and_force_takes_the_base_over() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--force"), "no hint in: {stderr}");
+    assert!(
+        !out.status.success(),
+        "a refused base must not fall back to git worktree add"
+    );
+    assert!(!scratch.path().join("one").exists());
     assert!(base.join("n.md").exists());
+    let plain = git_cow::add_or_plain(
+        project.path(),
+        &base,
+        "origin/main",
+        &scratch.path().join("three"),
+        Some("three"),
+        None,
+        &git_cow::Options::default(),
+    );
+    assert!(plain.is_err(), "add_or_plain fell back: {plain:?}");
+    assert!(!scratch.path().join("three").exists());
 
     let st = Command::new(bin)
         .args(["add", "--force", "-b", "two"])

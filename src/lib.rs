@@ -39,6 +39,9 @@ pub struct Options {
     /// [`add_with`] warms the template from the checkout at most this often, zero means every time
     /// and `Duration::MAX` never
     pub warm_interval: std::time::Duration,
+    /// `git worktree add --force`, and [`add_with`] also replaces a template path that is not a
+    /// git-cow extra checkout, such as a directory with files or a checkout on a branch
+    pub force: bool,
 }
 
 impl Default for Options {
@@ -46,6 +49,7 @@ impl Default for Options {
         Options {
             share: DEFAULT_SHARE.iter().map(|s| s.to_string()).collect(),
             warm_interval: std::time::Duration::from_secs(3600),
+            force: false,
         }
     }
 }
@@ -198,16 +202,30 @@ fn foreign(repo: &Path, template: &Path) -> bool {
         || git(template, &["symbolic-ref", "-q", "HEAD"]).is_ok()
 }
 
+/// The error inside the `io::Error` for a template path that is not a git-cow extra checkout,
+/// left alone unless [`Options::force`] is set. Test for it with [`is_refused`]
+#[derive(Debug)]
+pub struct Foreign(pub PathBuf);
+
+impl std::fmt::Display for Foreign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' is not a git-cow extra checkout, so it is left alone. Run git cow add with --force to replace it",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for Foreign {}
+
 fn not_ours(template: &Path) -> io::Error {
-    err(format!(
-        "'{}' is not a git-cow extra checkout, so it is left alone",
-        template.display()
-    ))
+    io::Error::other(Foreign(template.to_path_buf()))
 }
 
 // Create the template checkout, or move it to `start`
-fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
-    if foreign(repo, template) {
+fn refresh_template(repo: &Path, template: &Path, start: &str, force: bool) -> io::Result<()> {
+    if !force && foreign(repo, template) {
         return Err(not_ours(template));
     }
     if template.join(".git").exists()
@@ -413,6 +431,13 @@ pub fn is_occupied(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Occupied>())
 }
 
+/// Whether `e` is [`Occupied`] or [`Foreign`], a path git-cow refuses to touch. A plain
+/// `git worktree add` must not run instead, the user fixes the path or passes --force
+pub fn is_refused(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<Occupied>() || inner.is::<Foreign>())
+}
+
 // `b` if no branch has that name yet, so a failed add may delete it
 fn new_branch_name<'a>(repo: &Path, b: Option<&'a str>) -> Option<&'a str> {
     b.filter(|b| git(repo, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_err())
@@ -504,7 +529,7 @@ pub fn add_with(
     }
 
     let _lock = lock_template(template)?;
-    refresh_template(repo, template, template_start)?;
+    refresh_template(repo, template, template_start, opts.force)?;
     if template.join(".gitmodules").exists() {
         // A cloned submodule `.git` file would point into the template's gitdir
         return Err(err("submodules are not supported".into()));
@@ -523,6 +548,9 @@ pub fn add_with(
     // Until it succeeds `wt` is not ours, so a failure here only drops the branch git made first
     let wt_s = wt.to_string_lossy();
     let mut args = vec!["worktree", "add", "--no-checkout"];
+    if opts.force {
+        args.push("--force");
+    }
     if let Some(b) = new_branch {
         args.extend(["-b", b]);
     }
@@ -563,7 +591,8 @@ pub enum Added {
 
 /// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
 /// cloning fails. A failed clone leaves nothing behind, so the plain add starts clean. A `wt` that
-/// exists and is not empty fails with [`Occupied`] and no plain add
+/// exists and is not empty, or a template path that is not an extra checkout, fails with
+/// [`is_refused`] and no plain add
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,
@@ -585,12 +614,15 @@ pub fn add_or_plain(
     ) else {
         return Ok(Added::Cloned);
     };
-    if is_occupied(&why) {
+    if is_refused(&why) {
         return Err(why);
     }
 
     let wt_s = wt.to_string_lossy();
     let mut args = vec!["worktree", "add"];
+    if opts.force {
+        args.push("--force");
+    }
     if let Some(b) = new_branch {
         args.extend(["-b", b]);
     }

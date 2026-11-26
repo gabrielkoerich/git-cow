@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
+const USAGE: &str = "usage: git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]
        git cow list
        git cow remove [--warm] [--force] <worktree>   (or rm)
        git cow warm <worktree>
@@ -9,7 +9,8 @@ const USAGE: &str = "usage: git cow add [-b <branch>] [<path>] [<commit-ish>]
 
 add     creates a worktree as a copy-on-write clone of the extra checkout, or with git worktree
         add when cloning is not possible. Without <path> it goes to <root>/<repo>/<last part of the branch name>,
-        <root> being the cow.root setting (default ~/.worktrees)
+        <root> being the cow.root setting (default ~/.worktrees). -f is git worktree add's --force, and
+        also replaces a cow.base path that is not an extra checkout git-cow made
 list    lists the worktrees, without the extra checkout
 remove  removes a worktree and its branch when merged. --warm first gives its build output to
         the extra checkout, --force removes it with uncommitted changes. Never removes the extra
@@ -124,6 +125,7 @@ fn is_template(repo: &Path, path: &Path) -> bool {
 fn add(args: &[String]) -> ExitCode {
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut new_branch = None;
+    let mut force = false;
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -132,6 +134,7 @@ fn add(args: &[String]) -> ExitCode {
                 Some(b) => new_branch = Some(b.as_str()),
                 None => return usage(),
             },
+            "-f" | "--force" => force = true,
             // any other option is git's to handle
             s if s.starts_with('-') => return plain(args, "an option git-cow does not handle"),
             s => rest.push(s.to_string()),
@@ -163,6 +166,9 @@ fn add(args: &[String]) -> ExitCode {
     let mut git_args: Vec<String> = new_branch
         .map(|b| vec!["-b".into(), b.into()])
         .unwrap_or_default();
+    if force {
+        git_args.insert(0, "--force".into());
+    }
     git_args.extend(rest.iter().cloned());
     if std::env::var("GIT_COW").is_ok_and(|v| v == "0") {
         return plain(&git_args, "GIT_COW=0");
@@ -184,15 +190,18 @@ fn add(args: &[String]) -> ExitCode {
             &wt,
             new_branch,
             rest.get(1).map(String::as_str),
-            &git_cow::Options::from_repo(&repo),
+            &git_cow::Options {
+                force,
+                ..git_cow::Options::from_repo(&repo)
+            },
         )?;
         println!("{}", wt.display());
         Ok(())
     });
     match res {
         Ok(()) => ExitCode::SUCCESS,
-        // git worktree add would refuse the path too, after creating the branch
-        Err(e) if git_cow::is_occupied(&e) => {
+        // a plain worktree would hide that git-cow is not cloning, the user fixes the path instead
+        Err(e) if git_cow::is_refused(&e) => {
             eprintln!("git-cow: {e}");
             ExitCode::FAILURE
         }

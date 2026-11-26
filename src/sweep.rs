@@ -753,6 +753,7 @@ pub(crate) fn cleanup(args: &[String]) -> io::Result<()> {
             _ => return Err(other("give at most one branch to compare with".into())),
         }
     }
+    warn_without_squash_check();
     let Plan { repo, base, items } = plan(&std::env::current_dir()?, named, force)?;
     for item in &items {
         println!("{}", line(item));
@@ -815,6 +816,23 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+// git learned patch-id --verbatim in 2.39. Older git cannot tell a squash merge, so those branches
+// show as active and stay, which is safe but worth saying
+fn warn_without_squash_check() {
+    let works = git_cmd(Path::new("."))
+        .args(["patch-id", "--verbatim"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !works {
+        eprintln!(
+            "git-cow: this git is older than 2.39, so squash-merged branches show as active and stay"
+        );
+    }
+}
+
 /// List the worktrees of every repository at or below a folder, with how far their work landed.
 /// It reads only commits and refs, never a worktree's files, so no filter or hook a repository
 /// sets can run
@@ -824,6 +842,7 @@ pub(crate) fn tree(args: &[String]) -> io::Result<()> {
         [d] if !d.starts_with('-') => PathBuf::from(d),
         _ => return Err(other("give one folder".into())),
     };
+    warn_without_squash_check();
     for repo in repositories(&std::fs::canonicalize(&dir)?) {
         let Ok((_, linked)) = worktrees(&repo) else {
             continue;

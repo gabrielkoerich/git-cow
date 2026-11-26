@@ -39,9 +39,9 @@ pub struct Options {
     /// [`add_with`] warms the template from the checkout at most this often, zero means every time
     /// and `Duration::MAX` never
     pub warm_interval: std::time::Duration,
-    /// `git worktree add --force`, and [`add_with`] also replaces a template path that is a
-    /// directory with files outside git, [`Foreign::Files`]. A checkout is never replaced
-    pub force: bool,
+    /// How many times to pass `--force` to `git worktree add`, which counts it like `-f -f`. Any
+    /// count also lets [`add_with`] replace [`Foreign::Files`], and never another kind
+    pub force: u8,
 }
 
 impl Default for Options {
@@ -49,7 +49,7 @@ impl Default for Options {
         Options {
             share: DEFAULT_SHARE.iter().map(|s| s.to_string()).collect(),
             warm_interval: std::time::Duration::from_secs(3600),
-            force: false,
+            force: 0,
         }
     }
 }
@@ -196,15 +196,33 @@ fn real(dir: &Path, args: &[&str]) -> Option<PathBuf> {
     git(dir, args).ok().and_then(|p| fs::canonicalize(p).ok())
 }
 
+fn remove_any(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => {
+            let _ = fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
 // Move `template` aside, then delete it, so a delete cut short never leaves files at its path
 fn discard(template: &Path) {
     let aside = beside(template, "trash");
-    let _ = fs::remove_dir_all(&aside);
+    remove_any(&aside);
     if fs::rename(template, &aside).is_ok() {
-        let _ = fs::remove_dir_all(&aside);
+        remove_any(&aside);
     } else {
-        let _ = fs::remove_dir_all(template);
+        remove_any(template);
     }
+}
+
+// Every git-cow version takes this lock before it makes a template, so a path with the lock
+// beside it holds what is left of git-cow's own template
+fn made_by_git_cow(template: &Path) -> bool {
+    beside(template, "lock").exists()
 }
 
 /// A template path that is not a git-cow extra checkout, inside the `io::Error` that [`add_with`],
@@ -212,30 +230,48 @@ fn discard(template: &Path) {
 /// replaces [`Foreign::Files`]
 #[derive(Debug)]
 pub enum Foreign {
-    /// A directory with files outside git
+    /// A file, or a directory with files outside git
     Files(PathBuf),
     /// A main checkout, which git-cow would reset or delete
     Checkout(PathBuf),
     /// A worktree on this branch, while extra checkouts are always detached
     Branch(PathBuf, String),
+    /// A git repository itself, bare or a `.git` directory
+    Repository(PathBuf),
+    /// A directory with files tracked by the checkout at the second path
+    Inside(PathBuf, PathBuf),
+    /// A worktree git cannot read, for this reason, that git-cow did not make
+    Unreadable(PathBuf, String),
 }
 
 impl std::fmt::Display for Foreign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let elsewhere =
+            "so git-cow never uses it as its extra checkout. Set cow.base to another path";
         match self {
             Foreign::Files(p) => write!(
                 f,
-                "'{}' holds files and is not a git-cow extra checkout, so it is left alone. Run git cow add with --force to replace it",
+                "'{}' holds files and is not a git-cow extra checkout, so it is left alone. Use --force to replace it",
                 p.display()
             ),
-            Foreign::Checkout(p) => write!(
-                f,
-                "'{}' is a main checkout, so git-cow never uses it as its extra checkout. Set cow.base to another path",
-                p.display()
-            ),
+            Foreign::Checkout(p) => write!(f, "'{}' is a main checkout, {elsewhere}", p.display()),
             Foreign::Branch(p, b) => write!(
                 f,
-                "'{}' is a worktree on branch {b}, so git-cow never uses it as its extra checkout. Set cow.base to another path",
+                "'{}' is a worktree on branch {b}, {elsewhere}",
+                p.display()
+            ),
+            Foreign::Repository(p) => {
+                write!(f, "'{}' is a git repository, {elsewhere}", p.display())
+            }
+            Foreign::Inside(p, top) => write!(
+                f,
+                "'{}' holds files tracked by the checkout at '{}', {elsewhere}",
+                p.display(),
+                top.display()
+            ),
+            Foreign::Unreadable(p, why) => write!(
+                f,
+                "git cannot read the worktree at '{}' ({why}), {elsewhere}",
                 p.display()
             ),
         }
@@ -245,41 +281,61 @@ impl std::fmt::Display for Foreign {
 impl std::error::Error for Foreign {}
 
 // What git-cow never made a template of. Templates are detached linked worktrees, of this or
-// another repository with the same name, and anything git cannot read keeps the rebuild
-fn foreign(template: &Path) -> Option<Foreign> {
+// another repository with the same name. `made` is whether git-cow's lock sat beside the path
+fn foreign(template: &Path, made: bool) -> Option<Foreign> {
     let path = template.to_path_buf();
-    if !template.join(".git").exists() {
-        return occupied(template).then_some(Foreign::Files(path));
-    }
-    let (Some(gitdir), Some(common)) = (
-        real(template, &["rev-parse", "--absolute-git-dir"]),
-        real(
-            template,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ),
-    ) else {
+    if !occupied(template) {
         return None;
-    };
-    // a `.git` git does not read as this path's own, inside some other checkout
-    if real(template, &["rev-parse", "--show-toplevel"]) != fs::canonicalize(template).ok() {
-        return Some(Foreign::Files(path));
     }
-    if gitdir == common {
+    if template.join("HEAD").is_file()
+        && template.join("objects").is_dir()
+        && template.join("refs").is_dir()
+    {
+        return Some(Foreign::Repository(path));
+    }
+    let dot = template.join(".git");
+    // a template's `.git` is always a file, and an empty `.git` directory is no repository
+    if dot.join("HEAD").is_file() {
         return Some(Foreign::Checkout(path));
     }
-    git(template, &["symbolic-ref", "-q", "--short", "HEAD"])
-        .ok()
-        .map(|b| Foreign::Branch(path, b))
+    if dot.is_file() {
+        let gitdir = git(template, &["rev-parse", "--absolute-git-dir"]);
+        let common = real(
+            template,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        match (gitdir, common) {
+            (Ok(gitdir), Some(common))
+                if real(template, &["rev-parse", "--show-toplevel"])
+                    == fs::canonicalize(template).ok() =>
+            {
+                if fs::canonicalize(&gitdir).ok().as_ref() == Some(&common) {
+                    return Some(Foreign::Checkout(path));
+                }
+                return git(template, &["symbolic-ref", "-q", "--short", "HEAD"])
+                    .ok()
+                    .map(|b| Foreign::Branch(path, b));
+            }
+            // what is left of git-cow's own template is rebuilt, as before
+            (Err(_), _) if made => return None,
+            (Err(e), _) => return Some(Foreign::Unreadable(path, e.to_string())),
+            // a `.git` git reads as some other checkout's, so it is files inside that one
+            _ => {}
+        }
+    }
+    if git(template, &["ls-files"]).is_ok_and(|o| !o.is_empty()) {
+        let top = real(template, &["rev-parse", "--show-toplevel"]).unwrap_or_default();
+        return Some(Foreign::Inside(path, top));
+    }
+    if made {
+        return None;
+    }
+    Some(Foreign::Files(path))
 }
 
 // Create the template checkout, or move it to `start`
-fn refresh_template(repo: &Path, template: &Path, start: &str, force: bool) -> io::Result<()> {
-    match foreign(template) {
-        Some(Foreign::Files(_)) if force => {}
-        Some(f) => return Err(io::Error::other(f)),
-        None => {}
-    }
-    let _ = fs::remove_dir_all(beside(template, "trash"));
+fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
+    remove_any(&beside(template, "trash"));
     if template.join(".git").exists()
         && git(template, &["checkout", "--detach", "--force", start]).is_ok()
     {
@@ -410,7 +466,7 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
-    if let Some(f) = foreign(template) {
+    if let Some(f) = foreign(template, made_by_git_cow(template)) {
         return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
@@ -426,18 +482,28 @@ pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     if template.parent().is_none_or(|p| !p.exists()) {
         return Ok(());
     }
-    if let Some(f) = foreign(template) {
+    if let Some(f) = foreign(template, made_by_git_cow(template)) {
         return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
-    if template.join(".git").exists() {
-        git(
+    let registered = template.join(".git").exists();
+    let aside = beside(template, "trash");
+    remove_any(&aside);
+    // aside before git deletes it in place, so a delete cut short never leaves files at the path
+    let moved = fs::rename(template, &aside).is_ok();
+    if registered
+        && let Err(e) = git(
             repo,
             &["worktree", "remove", "--force", &template.to_string_lossy()],
-        )?;
+        )
+    {
+        if moved {
+            let _ = fs::rename(&aside, template);
+        }
+        return Err(e);
     }
-    discard(template);
-    let _ = fs::remove_dir_all(beside(template, "trash"));
+    remove_any(&aside);
+    remove_any(template);
     let _ = fs::remove_dir_all(beside(template, "warm"));
     for ext in ["warmed", "lock"] {
         match fs::remove_file(beside(template, ext)) {
@@ -503,9 +569,25 @@ pub fn is_unsupported(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Unsupported>())
 }
 
-// `b` if no branch has that name yet, so a failed add may delete it
-fn new_branch_name<'a>(repo: &Path, b: Option<&'a str>) -> Option<&'a str> {
-    b.filter(|b| git(repo, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_err())
+// The branch git worktree add creates if none has its name yet, so a failed add may delete it:
+// `-b`, or without a commit-ish one named after the path
+fn new_branch_name(
+    repo: &Path,
+    wt: &Path,
+    new_branch: Option<&str>,
+    commitish: Option<&str>,
+) -> Option<String> {
+    let b = match (new_branch, commitish) {
+        (Some(b), _) => b.to_string(),
+        (None, None) => wt.file_name()?.to_string_lossy().into_owned(),
+        _ => return None,
+    };
+    git(
+        repo,
+        &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+    )
+    .is_err()
+    .then_some(b)
 }
 
 // Something git worktree add refuses: anything but a missing path or an empty directory
@@ -593,8 +675,17 @@ pub fn add_with(
         return Err(io::Error::other(Unsupported("volume cannot clone files")));
     }
 
+    // checked before the lock, so a refused path gets no lock file beside it
+    let replace = match foreign(template, made_by_git_cow(template)) {
+        Some(Foreign::Files(_)) if opts.force > 0 => true,
+        Some(f) => return Err(io::Error::other(f)),
+        None => false,
+    };
     let _lock = lock_template(template)?;
-    refresh_template(repo, template, template_start, opts.force)?;
+    if replace {
+        discard(template);
+    }
+    refresh_template(repo, template, template_start)?;
     if template.join(".gitmodules").exists() {
         // A cloned submodule `.git` file would point into the template's gitdir
         return Err(io::Error::other(Unsupported(
@@ -610,14 +701,12 @@ pub fn add_with(
     }
 
     // Only a branch this call creates may be removed on failure, never one that was there before
-    let ours = new_branch_name(repo, new_branch);
+    let ours = new_branch_name(repo, wt, new_branch, commitish);
     // --no-checkout creates the gitdir entry and the `.git` file, so git state stays per worktree.
     // Until it succeeds `wt` is not ours, so a failure here only drops the branch git made first
     let wt_s = wt.to_string_lossy();
     let mut args = vec!["worktree", "add", "--no-checkout"];
-    if opts.force {
-        args.push("--force");
-    }
+    args.extend(std::iter::repeat_n("--force", opts.force.into()));
     if let Some(b) = new_branch {
         args.extend(["-b", b]);
     }
@@ -625,8 +714,8 @@ pub fn add_with(
     args.extend(commitish);
     let was_dir = wt.is_dir();
     if let Err(e) = git(repo, &args) {
-        if let Some(b) = ours {
-            let _ = git(repo, &["branch", "-D", b]);
+        if let Some(b) = &ours {
+            let _ = git(repo, &["branch", "-D", b.as_str()]);
         }
         return Err(e);
     }
@@ -640,8 +729,8 @@ pub fn add_with(
         if was_dir {
             let _ = fs::create_dir(wt);
         }
-        if let Some(b) = ours {
-            let _ = git(repo, &["branch", "-D", b]);
+        if let Some(b) = &ours {
+            let _ = git(repo, &["branch", "-D", b.as_str()]);
         }
     }
     res
@@ -685,19 +774,17 @@ pub fn add_or_plain(
 
     let wt_s = wt.to_string_lossy();
     let mut args = vec!["worktree", "add"];
-    if opts.force {
-        args.push("--force");
-    }
+    args.extend(std::iter::repeat_n("--force", opts.force.into()));
     if let Some(b) = new_branch {
         args.extend(["-b", b]);
     }
     args.push(&wt_s);
     args.extend(commitish);
-    let ours = new_branch_name(repo, new_branch);
+    let ours = new_branch_name(repo, wt, new_branch, commitish);
     if let Err(e) = git(repo, &args) {
         // git creates the branch before it checks the path
-        if let Some(b) = ours {
-            let _ = git(repo, &["branch", "-D", b]);
+        if let Some(b) = &ours {
+            let _ = git(repo, &["branch", "-D", b.as_str()]);
         }
         return Err(err(format!("{e}, after cloning failed: {why}")));
     }

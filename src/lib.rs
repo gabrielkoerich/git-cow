@@ -39,8 +39,8 @@ pub struct Options {
     /// [`add_with`] warms the template from the checkout at most this often, zero means every time
     /// and `Duration::MAX` never
     pub warm_interval: std::time::Duration,
-    /// `git worktree add --force`, and [`add_with`] also replaces a template path that is not a
-    /// git-cow extra checkout, such as a directory with files or a checkout on a branch
+    /// `git worktree add --force`, and [`add_with`] also replaces a template path that is a
+    /// directory with files outside git, [`Foreign::Files`]. A checkout is never replaced
     pub force: bool,
 }
 

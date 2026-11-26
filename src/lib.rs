@@ -242,6 +242,12 @@ pub enum Foreign {
     Inside(PathBuf, PathBuf),
     /// A worktree git cannot read, for this reason, that git-cow did not make
     Unreadable(PathBuf, String),
+    /// A detached worktree with no git-cow lock beside it, or one in a rebase, merge or bisect
+    Detached(PathBuf),
+    /// A directory holding the checkout or repository at the second path
+    Nested(PathBuf, PathBuf),
+    /// The home folder, or a folder above it
+    Home(PathBuf),
 }
 
 impl std::fmt::Display for Foreign {
@@ -274,6 +280,22 @@ impl std::fmt::Display for Foreign {
                 "git cannot read the worktree at '{}' ({why}), {elsewhere}",
                 p.display()
             ),
+            Foreign::Detached(p) => write!(
+                f,
+                "'{}' is a worktree git-cow did not make or one in the middle of a rebase, merge or bisect, {elsewhere}",
+                p.display()
+            ),
+            Foreign::Nested(p, inner) => write!(
+                f,
+                "'{}' holds the checkout or repository at '{}', {elsewhere}",
+                p.display(),
+                inner.display()
+            ),
+            Foreign::Home(p) => write!(
+                f,
+                "'{}' is or holds the home folder, {elsewhere}",
+                p.display()
+            ),
         }
     }
 }
@@ -294,8 +316,8 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
         return Some(Foreign::Repository(path));
     }
     let dot = template.join(".git");
-    // a template's `.git` is always a file, and an empty `.git` directory is no repository
-    if dot.join("HEAD").is_file() {
+    // a template's `.git` is always a file, and only an empty `.git` directory is no repository
+    if dot.is_dir() && occupied(&dot) {
         return Some(Foreign::Checkout(path));
     }
     if dot.is_file() {
@@ -312,9 +334,14 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
                 if fs::canonicalize(&gitdir).ok().as_ref() == Some(&common) {
                     return Some(Foreign::Checkout(path));
                 }
-                return git(template, &["symbolic-ref", "-q", "--short", "HEAD"])
-                    .ok()
-                    .map(|b| Foreign::Branch(path, b));
+                if let Ok(b) = git(template, &["symbolic-ref", "-q", "--short", "HEAD"]) {
+                    return Some(Foreign::Branch(path, b));
+                }
+                // a detached HEAD is git-cow's only with its lock, and never while a user is mid-rebase
+                let busy = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "BISECT_LOG"]
+                    .iter()
+                    .any(|f| Path::new(&gitdir).join(f).exists());
+                return (!made || busy).then_some(Foreign::Detached(path));
             }
             // what is left of git-cow's own template is rebuilt, as before
             (Err(_), _) if made => return None,
@@ -327,10 +354,46 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
         let top = real(template, &["rev-parse", "--show-toplevel"]).unwrap_or_default();
         return Some(Foreign::Inside(path, top));
     }
+    if let Some(inner) = nested_repository(template) {
+        return Some(Foreign::Nested(path, inner));
+    }
+    let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
+    if let (Some(home), Ok(real)) = (home, fs::canonicalize(template))
+        && home.starts_with(&real)
+    {
+        return Some(Foreign::Home(path));
+    }
     if made {
         return None;
     }
     Some(Foreign::Files(path))
+}
+
+// The first checkout or repository below `dir`, without following symlinks. An empty `.git`
+// directory holds nothing, so it does not count
+fn nested_repository(dir: &Path) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if entry.file_name() == ".git" && (kind.is_file() || occupied(&path)) {
+                return Some(d);
+            }
+            if kind.is_dir() {
+                if path.join("HEAD").is_file() && path.join("objects").is_dir() {
+                    return Some(path);
+                }
+                stack.push(path);
+            }
+        }
+    }
+    None
 }
 
 // Create the template checkout, or move it to `start`
@@ -425,10 +488,34 @@ fn ignored_dirs(src: &Path, share: &[String]) -> io::Result<Vec<String>> {
         .collect())
 }
 
+// Whether `path`, or the nearest part of it that exists, resolves inside `root`
+fn within(root: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .find_map(|a| fs::canonicalize(a).ok())
+        .is_some_and(|a| a.starts_with(root))
+}
+
+// `std::path::absolute` with `..` resolved by name, so `repo/..` is never a path git-cow deletes
+fn absolute(path: &Path) -> io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in std::path::absolute(path)?.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 // Swap a clone of each ignored directory of `src` into the template. Loose ignored files stay
 // out, so local secrets such as .env never reach a worktree
 fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()> {
     let staging = beside(template, "warm");
+    let root = fs::canonicalize(template)?;
     for dir in ignored_dirs(src, share)? {
         // A directory the template commit tracks is not build output
         if !git(template, &["ls-files", "--", &dir])
@@ -443,6 +530,10 @@ fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()
         let _ = (|| {
             clone_into(&src.join(&dir), &staging)?;
             let dst = template.join(&dir);
+            // a tracked symlink on the way would lead the swap out of the template
+            if !within(&root, &dst) {
+                return Ok(());
+            }
             let _ = fs::remove_dir_all(&dst);
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
@@ -463,6 +554,7 @@ pub fn warm(src: &Path, template: &Path) -> io::Result<()> {
 
 /// [`warm`] with your own [`Options`]. It always warms, the interval only applies to [`add_with`]
 pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> {
+    let template = &absolute(template)?;
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
@@ -478,7 +570,7 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
 /// Call it only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would
 /// get a deleted file, and the next caller a new one
 pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
-    let template = &std::path::absolute(template)?;
+    let template = &absolute(template)?;
     if template.parent().is_none_or(|p| !p.exists()) {
         return Ok(());
     }
@@ -655,8 +747,8 @@ pub fn add_with(
     opts: &Options,
 ) -> io::Result<()> {
     // git resolves a relative path against `repo` and the file calls against the current directory
-    let wt = &std::path::absolute(wt)?;
-    let template = &std::path::absolute(template)?;
+    let wt = &absolute(wt)?;
+    let template = &absolute(template)?;
     if occupied(wt) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -756,7 +848,7 @@ pub fn add_or_plain(
     commitish: Option<&str>,
     opts: &Options,
 ) -> io::Result<Added> {
-    let wt = &std::path::absolute(wt)?;
+    let wt = &absolute(wt)?;
     let Err(why) = add_with(
         repo,
         template,

@@ -10,7 +10,7 @@ use git_cow::REPO_ENV;
 use crate::{is_template, other};
 
 // Ahead of every git call here: no fsmonitor program from a repository's own config, and no index
-// refresh written back, so reading a repository never runs or changes anything in it
+// refresh written back. `git status` can still run a clean filter, so only cleanup calls it
 const QUIET: &[&str] = &["-c", "core.fsmonitor=false", "--no-optional-locks"];
 
 // Diffs compared byte for byte, without a diff program or textconv filter a repository may set
@@ -628,7 +628,8 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// List the worktrees of every repository at or below a folder, with how far their work landed.
-/// It runs git read-only in each repository it finds, with no fsmonitor and no index writes
+/// It reads only commits and refs, never a worktree's files, so no filter or hook a repository
+/// sets can run
 pub(crate) fn tree(args: &[String]) -> io::Result<()> {
     let dir = match args {
         [] => std::env::current_dir()?,
@@ -661,12 +662,7 @@ pub(crate) fn tree(args: &[String]) -> io::Result<()> {
         for (wt, state) in linked.iter().zip(states) {
             let label = state.map_or("?", State::label);
             let branch = wt.branch.as_deref().unwrap_or("(detached)");
-            let changes = if has_changes(&wt.path) {
-                "\t(has changes)"
-            } else {
-                ""
-            };
-            println!("  {label}\t{branch}\t{}{changes}", wt.path.display());
+            println!("  {label}\t{branch}\t{}", wt.path.display());
         }
     }
     Ok(())

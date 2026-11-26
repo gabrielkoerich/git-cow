@@ -1,4 +1,4 @@
-// Alone in its own binary, since it changes the process's current directory
+//! Relative paths, alone in their own binary since the test changes the current directory
 use std::path::Path;
 use std::process::Command;
 

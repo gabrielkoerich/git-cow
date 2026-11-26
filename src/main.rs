@@ -1,3 +1,10 @@
+//! The `git cow` command line
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a CLI talks on stdout and stderr"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -122,6 +129,10 @@ fn is_template(repo: &Path, path: &Path) -> bool {
             .is_some_and(|t| t == path)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one add, from its arguments to the fallback, read top to bottom"
+)]
 fn add(args: &[String]) -> ExitCode {
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut new_branch = None;

@@ -1,3 +1,5 @@
+//! The library and the `git cow` command against real repositories and volumes
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -738,7 +740,7 @@ fn add_warms_again_once_the_interval_passed() {
             Some("origin/main"),
             &opts,
         )
-        .unwrap()
+        .unwrap();
     };
     std::fs::create_dir_all(p.join("out")).unwrap();
     std::fs::write(p.join("out/one.bin"), "1\n").unwrap();
@@ -903,7 +905,7 @@ fn add_or_plain_clones_or_falls_back() {
             why.to_string().contains("submodules") || !supported(scratch.path()),
             "{why}"
         ),
-        other => panic!("expected the plain fallback, got {other:?}"),
+        git_cow::Added::Cloned => panic!("expected the plain fallback, got a clone"),
     }
     assert!(clean(&scratch.path().join("w2")));
     sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2"]);
@@ -1508,7 +1510,6 @@ fn two_repositories_share_one_template_path() {
 // A probe that cannot write is a clone error, not a volume without cloning, and falls back
 #[test]
 fn unwritable_template_parent_falls_back_with_the_reason() {
-    use std::os::unix::fs::PermissionsExt;
     let uid = Command::new("id").arg("-u").output().unwrap();
     // root writes through mode 555
     if String::from_utf8_lossy(&uid.stdout).trim() == "0" {

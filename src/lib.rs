@@ -2,11 +2,15 @@
 //! macOS clones whole directories with clonefile(2), Linux uses `cp --reflink=always` (FICLONE)
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::ffi::{CString, c_char, c_int};
 use std::fs::{self, File};
 use std::io;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 /// Hidden directories that hold only build caches, so they are shared like any other ignored
 /// directory. Every other path with a hidden component is tool or agent config and stays out
@@ -47,7 +51,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            share: DEFAULT_SHARE.iter().map(|s| s.to_string()).collect(),
+            share: DEFAULT_SHARE.iter().map(ToString::to_string).collect(),
             warm_interval: std::time::Duration::from_secs(3600),
             force: 0,
         }
@@ -96,8 +100,6 @@ fn parse_interval(v: &str) -> Option<std::time::Duration> {
 // Clone `src`, a file or a whole directory, to `dst_dir/<its name>` in one call
 #[cfg(target_os = "macos")]
 fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
-    use std::ffi::{CString, c_char, c_int};
-    use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
         fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
     }
@@ -107,6 +109,7 @@ fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
         .ok_or_else(|| err(format!("{} has no name", src.display())))?;
     let s = CString::new(src.as_os_str().as_bytes()).map_err(io::Error::other)?;
     let d = CString::new(dst_dir.join(name).as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: both pointers come from CStrings that outlive the call, and clonefile only reads them
     if unsafe { clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } != 0 {
         let e = io::Error::last_os_error();
         return Err(err(format!("clonefile {}: {e}", src.display())));
@@ -145,6 +148,10 @@ pub const REPO_ENV: &[&str] = &[
 ];
 
 /// Runs git in `dir`, without [`REPO_ENV`], and returns its trimmed stdout
+///
+/// # Errors
+///
+/// When git cannot start, or exits with an error that holds its stderr
 pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
     let mut cmd = Command::new("git");
     for var in REPO_ENV {
@@ -171,7 +178,8 @@ pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
 fn probe(src_dir: &Path, dst_dir: &Path) -> io::Result<bool> {
     let key = (src_dir.to_path_buf(), dst_dir.to_path_buf());
     // Held through the probe, since threads probing at once would share its file names
-    let mut probes = PROBES.lock().unwrap();
+    // a panic elsewhere while holding it leaves only cached probe results, still valid
+    let mut probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(known) = probes.get(&key) {
         return Ok(*known);
     }
@@ -319,8 +327,9 @@ impl std::fmt::Display for Foreign {
 impl std::error::Error for Foreign {}
 
 // What git-cow never made a template of. Templates are detached linked worktrees, of this or
-// another repository with the same name. `made` is whether git-cow's lock sat beside the path
-fn foreign(template: &Path, made: bool) -> Option<Foreign> {
+// another repository with the same name
+fn foreign(template: &Path) -> Option<Foreign> {
+    let made = made_by_git_cow(template);
     let path = template.to_path_buf();
     if !occupied(template) {
         return None;
@@ -571,17 +580,25 @@ fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()
 
 /// Refresh an existing `template` with the gitignored directories of `src`, a checkout or a
 /// worktree whose work merged. Shares the hidden directories in [`DEFAULT_SHARE`]
+///
+/// # Errors
+///
+/// As [`warm_with`]
 pub fn warm(src: &Path, template: &Path) -> io::Result<()> {
     warm_with(src, template, &Options::default())
 }
 
 /// [`warm`] with your own [`Options`]. It always warms, the interval only applies to [`add_with`]
+///
+/// # Errors
+///
+/// When `template` is no extra checkout or is [`Foreign`], or its lock or a git call fails
 pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> {
     let template = &absolute(template)?;
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
-    if let Some(f) = foreign(template, made_by_git_cow(template)) {
+    if let Some(f) = foreign(template) {
         return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
@@ -593,12 +610,16 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
 /// A path that is not an extra checkout git-cow made fails with [`Foreign`] and stays. Call it
 /// only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would get a
 /// deleted file, and the next caller a new one
+///
+/// # Errors
+///
+/// When `template` is [`Foreign`], or `git worktree remove` or deleting a file fails
 pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     let template = &absolute(template)?;
     if template.parent().is_none_or(|p| !p.exists()) {
         return Ok(());
     }
-    if let Some(f) = foreign(template, made_by_git_cow(template)) {
+    if let Some(f) = foreign(template) {
         return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
@@ -663,7 +684,7 @@ impl std::error::Error for Occupied {}
 /// Whether `e` is [`add_with`] refusing a `wt` that exists and is not empty, where a plain
 /// `git worktree add` would fail too
 pub fn is_occupied(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<Occupied>())
+    matches!(e.get_ref(), Some(inner) if inner.is::<Occupied>())
 }
 
 /// The error inside the `io::Error` when git-cow cannot clone here at all: the volume has no
@@ -682,7 +703,7 @@ impl std::error::Error for Unsupported {}
 /// Whether `e` is [`Unsupported`], where a plain `git worktree add` is expected. Any other clone
 /// error also falls back in [`add_or_plain`], and a caller may warn that cloning failed
 pub fn is_unsupported(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<Unsupported>())
+    matches!(e.get_ref(), Some(inner) if inner.is::<Unsupported>())
 }
 
 /// Whether `e` is [`Occupied`] or [`Foreign`], a path git-cow leaves alone. A plain
@@ -748,6 +769,10 @@ fn populate(template: &Path, wt: &Path) -> io::Result<()> {
 /// Create `wt` by cloning `template`, refreshed to `template_start` and warmed from `repo` first.
 /// `new_branch` and `commitish` are `git worktree add`'s. Like it, refuses a `wt` that exists and
 /// is not empty, and on error removes only the worktree and branch this call created
+///
+/// # Errors
+///
+/// As [`add_with`]
 pub fn add(
     repo: &Path,
     template: &Path,
@@ -768,6 +793,10 @@ pub fn add(
 }
 
 /// [`add`] with your own [`Options`]
+///
+/// # Errors
+///
+/// When `wt` is [`Occupied`], the template path is [`Foreign`], cloning is [`Unsupported`], or a git or file call fails. [`is_refused`] and [`is_unsupported`] tell them apart
 pub fn add_with(
     repo: &Path,
     template: &Path,
@@ -783,7 +812,7 @@ pub fn add_with(
     if occupied(wt) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            Occupied(wt.to_path_buf()),
+            Occupied(wt.clone()),
         ));
     }
     let wt_parent = wt
@@ -799,7 +828,7 @@ pub fn add_with(
     }
 
     // checked before the lock, so a refused path gets no lock file beside it
-    let replace = match foreign(template, made_by_git_cow(template)) {
+    let replace = match foreign(template) {
         Some(Foreign::Files(_)) if opts.force > 0 => true,
         Some(f) => return Err(io::Error::other(f)),
         None => false,
@@ -861,6 +890,10 @@ pub fn add_with(
 
 /// How [`add_or_plain`] made the worktree
 #[derive(Debug)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "a clone or a plain worktree is the whole answer, and #[non_exhaustive] would break callers that match it"
+)]
 pub enum Added {
     /// Cloned from the template
     Cloned,
@@ -870,6 +903,10 @@ pub enum Added {
 
 /// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
 /// cloning fails. A path [`is_refused`] is returned with no plain add
+///
+/// # Errors
+///
+/// When the path [`is_refused`], or the plain `git worktree add` fails too
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,

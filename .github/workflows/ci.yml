@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  # The use_in_fn lint from dylint.toml, which clippy has no rule for
+  dylint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-dylint@6.3.2,dylint-link@6.3.2
+      # The nightly that rust-toolchain.toml in the dylint-lints repository pins for the lint
+      - run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.dylint_drivers
+          key: dylint-drivers-${{ runner.os }}-nightly-2026-08-20-6.3.2
+      - env:
+          DYLINT_RUSTFLAGS: "-D warnings"
+        run: cargo dylint --all -- --all-targets
+
   test:
     strategy:
       matrix:
@@ -41,7 +60,7 @@ jobs:
 
   # On main: next version from conventional commits (feat minor, breaking major, else patch), publish, tag, release
   release:
-    needs: test
+    needs: [dylint, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

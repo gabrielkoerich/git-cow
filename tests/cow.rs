@@ -1014,6 +1014,7 @@ fn cli_fails_when_the_default_path_is_another_worktree() {
         std::fs::read_to_string(wt.join("uncommitted.txt")).unwrap(),
         "work\n"
     );
+    assert!(!has_branch(project.path(), "fix/login"));
     sh(
         &wt,
         &["rev-parse", "--verify", "-q", "refs/heads/feat/login"],
@@ -1037,4 +1038,102 @@ fn add_into_an_empty_directory_works_like_git() {
     res.expect("an empty directory is a valid target");
     assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
     assert!(clean(&wt));
+}
+
+fn has_branch(repo: &Path, b: &str) -> bool {
+    let out = Command::new("git")
+        .args(["branch", "--list", b])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    !out.stdout.is_empty()
+}
+
+// git worktree add creates the -b branch before it refuses a registered path whose directory is gone
+#[test]
+fn failed_add_into_a_missing_worktree_leaves_no_branch() {
+    let (_r, project, scratch) = setup();
+    let tpl = scratch.path().join(".git-cow/p");
+    let wt = scratch.path().join("moved");
+    sh(
+        project.path(),
+        &["worktree", "add", "-q", "-b", "first", wt.to_str().unwrap()],
+    );
+    std::fs::rename(&wt, scratch.path().join("elsewhere")).unwrap();
+
+    let res = git_cow::add(
+        project.path(),
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("second"),
+        None,
+    );
+    assert!(res.is_err());
+    assert!(!has_branch(project.path(), "second"), "add left its branch");
+    let res = git_cow::add_or_plain(
+        project.path(),
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("third"),
+        None,
+        &git_cow::Options::default(),
+    );
+    assert!(res.is_err());
+    assert!(
+        !has_branch(project.path(), "third"),
+        "add_or_plain left its branch"
+    );
+    assert!(has_branch(project.path(), "first"));
+}
+
+#[test]
+fn cli_failed_add_into_a_missing_worktree_leaves_no_branch() {
+    let (_r, project, scratch) = setup();
+    let root = scratch.path().join("wts");
+    sh(
+        project.path(),
+        &["config", "cow.root", root.to_str().unwrap()],
+    );
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let st = Command::new(bin)
+        .args(["add", "-b", "feat/login"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let wt = root.join(project.path().file_name().unwrap()).join("login");
+    std::fs::rename(&wt, scratch.path().join("elsewhere")).unwrap();
+    let st = Command::new(bin)
+        .args(["add", "-b", "fix/login"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(!st.success());
+    assert!(!has_branch(project.path(), "fix/login"));
+    assert!(has_branch(project.path(), "feat/login"));
+}
+
+// Only an occupied worktree path skips the fallback, not any AlreadyExists on the way
+#[test]
+fn add_or_plain_falls_back_when_the_template_parent_is_a_file() {
+    let (_r, project, scratch) = setup();
+    let file = scratch.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    let wt = scratch.path().join("wt");
+    let res = git_cow::add_or_plain(
+        project.path(),
+        &file.join("p"),
+        "origin/main",
+        &wt,
+        Some("plain"),
+        None,
+        &git_cow::Options::default(),
+    );
+    assert!(
+        matches!(res, Ok(git_cow::Added::Plain(_))),
+        "expected a plain add, got {res:?}"
+    );
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
 }

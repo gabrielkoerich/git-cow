@@ -132,9 +132,25 @@ fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Runs git in `dir` and returns its trimmed stdout
+/// Variables that point git at another repository or index than `-C` names, set by hooks or
+/// `git --git-dir`. git-cow's own calls would read or rewrite the user's repository through them
+pub const REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+];
+
+/// Runs git in `dir`, without [`REPO_ENV`], and returns its trimmed stdout
 pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    let mut cmd = Command::new("git");
+    for var in REPO_ENV {
+        cmd.env_remove(var);
+    }
+    let out = cmd.arg("-C").arg(dir).args(args).output()?;
     if !out.status.success() {
         return Err(err(format!(
             "git {args:?}: {}",
@@ -338,9 +354,17 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
                     return Some(Foreign::Branch(path, b));
                 }
                 // a detached HEAD is git-cow's only with its lock, and never while a user is mid-rebase
-                let busy = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "BISECT_LOG"]
-                    .iter()
-                    .any(|f| Path::new(&gitdir).join(f).exists());
+                let busy = [
+                    "rebase-merge",
+                    "rebase-apply",
+                    "MERGE_HEAD",
+                    "BISECT_LOG",
+                    "CHERRY_PICK_HEAD",
+                    "REVERT_HEAD",
+                    "sequencer",
+                ]
+                .iter()
+                .any(|f| Path::new(&gitdir).join(f).exists());
                 return (!made || busy).then_some(Foreign::Detached(path));
             }
             // what is left of git-cow's own template is rebuilt, as before
@@ -350,6 +374,13 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
             _ => {}
         }
     }
+    // before the scan, which would walk all of home
+    let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
+    if let (Some(home), Ok(real)) = (home, fs::canonicalize(template))
+        && home.starts_with(&real)
+    {
+        return Some(Foreign::Home(path));
+    }
     if git(template, &["ls-files"]).is_ok_and(|o| !o.is_empty()) {
         let top = real(template, &["rev-parse", "--show-toplevel"]).unwrap_or_default();
         return Some(Foreign::Inside(path, top));
@@ -357,15 +388,7 @@ fn foreign(template: &Path, made: bool) -> Option<Foreign> {
     if let Some(inner) = nested_repository(template) {
         return Some(Foreign::Nested(path, inner));
     }
-    let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
-    if let (Some(home), Ok(real)) = (home, fs::canonicalize(template))
-        && home.starts_with(&real)
-    {
-        return Some(Foreign::Home(path));
-    }
-    if made {
-        return None;
-    }
+    // the lock outlives the template, so without a `.git` it proves nothing and --force decides
     Some(Foreign::Files(path))
 }
 

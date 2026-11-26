@@ -250,7 +250,11 @@ fn add(args: &[String]) -> ExitCode {
 
 fn plain(args: &[String], why: &str) -> ExitCode {
     eprintln!("git-cow: {why}, using git worktree add");
-    let ok = Command::new("git")
+    let mut git = Command::new("git");
+    for var in git_cow::REPO_ENV {
+        git.env_remove(var);
+    }
+    let ok = git
         .args(["worktree", "add"])
         .args(args)
         .status()

@@ -203,7 +203,7 @@ fn foreign(repo: &Path, template: &Path) -> bool {
 }
 
 /// The error inside the `io::Error` for a template path that is not a git-cow extra checkout,
-/// left alone unless [`Options::force`] is set. Test for it with [`is_refused`]
+/// left alone unless [`Options::force`] is set
 #[derive(Debug)]
 pub struct Foreign(pub PathBuf);
 
@@ -431,11 +431,23 @@ pub fn is_occupied(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Occupied>())
 }
 
-/// Whether `e` is [`Occupied`] or [`Foreign`], a path git-cow refuses to touch. A plain
-/// `git worktree add` must not run instead, the user fixes the path or passes --force
-pub fn is_refused(e: &io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(|inner| inner.is::<Occupied>() || inner.is::<Foreign>())
+/// The error inside the `io::Error` when git-cow cannot clone here at all: the volume has no
+/// clone support or the repository has submodules. Test for it with [`is_unsupported`]
+#[derive(Debug)]
+pub struct Unsupported(pub &'static str);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
+/// Whether `e` is [`Unsupported`], the one error after which a plain `git worktree add` runs.
+/// Any other error is for the user to fix, so a plain worktree never hides it
+pub fn is_unsupported(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Unsupported>())
 }
 
 // `b` if no branch has that name yet, so a failed add may delete it
@@ -525,14 +537,16 @@ pub fn add_with(
     fs::create_dir_all(wt_parent)?;
     fs::create_dir_all(tpl_parent)?;
     if !can_clone(tpl_parent, wt_parent) {
-        return Err(err("volume cannot clone files".into()));
+        return Err(io::Error::other(Unsupported("volume cannot clone files")));
     }
 
     let _lock = lock_template(template)?;
     refresh_template(repo, template, template_start, opts.force)?;
     if template.join(".gitmodules").exists() {
         // A cloned submodule `.git` file would point into the template's gitdir
-        return Err(err("submodules are not supported".into()));
+        return Err(io::Error::other(Unsupported(
+            "submodules are not supported",
+        )));
     }
     // Re-cloning big caches on every add costs seconds, and a template an hour old only means a
     // little more rebuilding. Bare repositories have no ignored files, so nothing changes for them
@@ -585,14 +599,12 @@ pub fn add_with(
 pub enum Added {
     /// Cloned from the template
     Cloned,
-    /// With `git worktree add`, after cloning failed for this reason
+    /// With `git worktree add`, since cloning is [`Unsupported`] for this reason
     Plain(io::Error),
 }
 
 /// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
-/// cloning fails. A failed clone leaves nothing behind, so the plain add starts clean. A `wt` that
-/// exists and is not empty, or a template path that is not an extra checkout, fails with
-/// [`is_refused`] and no plain add
+/// cloning is [`Unsupported`]. Any other error is returned with no plain add
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,
@@ -614,7 +626,7 @@ pub fn add_or_plain(
     ) else {
         return Ok(Added::Cloned);
     };
-    if is_refused(&why) {
+    if !is_unsupported(&why) {
         return Err(why);
     }
 

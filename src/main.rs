@@ -200,8 +200,9 @@ fn add(args: &[String]) -> ExitCode {
     });
     match res {
         Ok(()) => ExitCode::SUCCESS,
-        // a plain worktree would hide that git-cow is not cloning, the user fixes the path instead
-        Err(e) if git_cow::is_refused(&e) => {
+        // a plain worktree would hide that git-cow is not cloning, so only an unsupported clone
+        // falls back and any other error is the user's to fix
+        Err(e) if !git_cow::is_unsupported(&e) => {
             eprintln!("git-cow: {e}");
             ExitCode::FAILURE
         }

@@ -2072,7 +2072,7 @@ fn cli_ignores_an_inherited_git_index() {
 
 // Worktrees and branches in every state cleanup tells apart, against origin/main
 struct Sweep {
-    _r: tempfile::TempDir,
+    remote: tempfile::TempDir,
     project: tempfile::TempDir,
     scratch: tempfile::TempDir,
 }
@@ -2149,7 +2149,7 @@ fn sweep_setup() -> Sweep {
     );
     let _ = (merged, squashed);
     Sweep {
-        _r: r,
+        remote: r,
         project,
         scratch,
     }
@@ -2527,4 +2527,69 @@ fn tree_writes_nothing() {
         before,
         "tree or a dry run wrote objects"
     );
+}
+
+// Cleanup deletes local branches only: the remote keeps every branch, and its tracking refs stay
+#[test]
+fn cleanup_never_deletes_a_remote_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    for b in [
+        "feat-merged",
+        "feat-squashed",
+        "only-merged",
+        "only-squashed",
+    ] {
+        sh(p, &["push", "-q", "origin", b]);
+    }
+    let remote_heads = |dir: &Path| {
+        let out = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = remote_heads(w.remote.path());
+    let tracking = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/remotes/"])
+        .current_dir(p)
+        .output()
+        .unwrap()
+        .stdout;
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!has_branch(p, "only-merged"), "the local branch stayed");
+    assert_eq!(
+        remote_heads(w.remote.path()),
+        before,
+        "a branch was deleted on the remote"
+    );
+    let after = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/remotes/"])
+        .current_dir(p)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(after, tracking, "a remote tracking ref changed");
+}
+
+// tree reads only commits and refs, so a clean filter from a repository's own config never runs
+#[test]
+fn tree_never_runs_a_repository_filter() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("filter-ran");
+    sh(
+        p,
+        &[
+            "config",
+            "filter.spy.clean",
+            &format!("touch {} && cat", marker.display()),
+        ],
+    );
+    let wt = w.wt("feat-active");
+    std::fs::write(wt.join(".gitattributes"), "*.txt filter=spy\n").unwrap();
+    std::fs::write(wt.join("feat-active.txt"), "changed\n").unwrap();
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    assert!(!marker.exists(), "tree ran the repository's clean filter");
 }

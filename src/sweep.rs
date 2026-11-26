@@ -232,49 +232,68 @@ fn is_partial(repo: &Path) -> bool {
             .is_ok_and(|o| o.lines().any(|l| l.ends_with(" true")))
 }
 
-// The files `rev` changed since `mb` hold the same content in the base, so a patch match is not
-// the same edit in another place of a file, or a squash the base reverted later
-fn files_match(repo: &Path, base: &str, mb: &str, rev: &str) -> bool {
-    let Ok(out) = git_cmd(repo)
-        .args(["diff", "--name-only", "-z", "--no-renames", mb, rev])
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    let names = String::from_utf8_lossy(&out.stdout).into_owned();
-    let paths: Vec<&str> = names.split('\0').filter(|p| !p.is_empty()).collect();
-    if !out.status.success() || paths.is_empty() {
-        return false;
-    }
-    let mut args = vec![
-        "--literal-pathspecs",
-        "diff",
-        "--quiet",
-        "--no-ext-diff",
-        "--no-textconv",
-        base,
-        rev,
-        "--",
-    ];
-    args.extend(paths);
-    run(repo, &args).is_ok()
+// The `@@` lines of a zero context diff, which say where each change sits in each file. patch-id
+// ignores them, so the same edit in another place of a file would match without this
+fn hunk_lines(repo: &Path, from: &str, to: &str) -> Option<String> {
+    let mut args = vec!["diff", "-U0"];
+    args.extend(DIFF);
+    args.extend([from, to]);
+    let out = run(repo, &args).ok()?;
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("@@") || l.starts_with("diff --git"))
+        .collect();
+    Some(lines.join("\n"))
 }
 
-// The patch id of everything `rev` changed since its merge base with the base, the base commits
-// after that merge base, and the merge base. None for an ancestor, or a rev that changes nothing
-fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<(String, String, String)> {
+struct Probe {
+    // patch ids of what the rev changed since the merge base, and of undoing it
+    own: String,
+    undo: String,
+    // base commits after the merge base, newest first
+    commits: String,
+    mb: String,
+}
+
+// None for an ancestor of the base, or a rev that changes nothing in total
+fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<Probe> {
     if run(repo, &["merge-base", "--is-ancestor", rev, base]).is_ok() {
         return None;
     }
     let mb = run(repo, &["merge-base", base, rev]).ok()?;
-    let mut args = vec!["diff"];
-    args.extend(DIFF);
-    args.extend([mb.as_str(), rev]);
-    let own = patch_ids(repo, &args, None).ok()?;
-    let own = own.split_whitespace().next()?.to_string();
+    let pid = |from: &str, to: &str| {
+        let mut args = vec!["diff"];
+        args.extend(DIFF);
+        args.extend([from, to]);
+        let out = patch_ids(repo, &args, None).ok()?;
+        out.split_whitespace().next().map(String::from)
+    };
+    let own = pid(&mb, rev)?;
+    let undo = pid(rev, &mb)?;
     let commits = run(repo, &["rev-list", "--no-merges", base, &format!("^{mb}")]).ok()?;
-    Some((own, commits, mb))
+    Some(Probe {
+        own,
+        undo,
+        commits,
+        mb,
+    })
+}
+
+// A base commit after the merge base with the rev's patch, at the same places in the same files,
+// and no later base commit that undoes it
+fn squashed(repo: &Path, rev: &str, probe: &Probe, by_commit: &HashMap<String, String>) -> bool {
+    let commits: Vec<&str> = probe.commits.lines().collect();
+    let Some(own_hunks) = hunk_lines(repo, &probe.mb, rev) else {
+        return false;
+    };
+    commits.iter().enumerate().any(|(i, c)| {
+        by_commit.get(*c) == Some(&probe.own)
+            && hunk_lines(repo, &format!("{c}^"), c).as_ref() == Some(&own_hunks)
+            // rev-list lists newer commits first, so an undo of the squash sits before it
+            && !commits[..i]
+                .iter()
+                .any(|later| by_commit.get(*later) == Some(&probe.undo))
+    })
 }
 
 // Patch ids of `commits`, all in one `git log`. An empty commit has none, so it matches nothing
@@ -306,11 +325,11 @@ fn commit_patch_ids(repo: &Path, commits: &HashSet<&str>) -> HashMap<String, Str
     by_commit
 }
 
-// Merged is an ancestor of the base. Squashed is git-extras' check with whitespace counted: the
-// whole change since the merge base has the patch id of one base commit after it
+// Merged is an ancestor of the base. Squashed is git-extras' check with whitespace and positions
+// counted: one base commit after the merge base made the whole change, and none undid it
 fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<State> {
     let partial = is_partial(repo);
-    let probes: Vec<Option<(String, String, String)>> = revs
+    let probes: Vec<Option<Probe>> = revs
         .iter()
         .map(|(rev, _)| {
             if partial {
@@ -323,7 +342,7 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
     let wanted: HashSet<&str> = probes
         .iter()
         .flatten()
-        .flat_map(|(_, commits, _)| commits.lines())
+        .flat_map(|p| p.commits.lines())
         .collect();
     let by_commit = commit_patch_ids(repo, &wanted);
     revs.iter()
@@ -332,13 +351,10 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
             if run(repo, &["merge-base", "--is-ancestor", rev, &base.oid]).is_ok() {
                 return State::Merged;
             }
-            let squashed = probe.as_ref().is_some_and(|(own, commits, mb)| {
-                commits
-                    .lines()
-                    .any(|c| by_commit.get(c).is_some_and(|pid| pid == own))
-                    && files_match(repo, &base.oid, mb, rev)
-            });
-            if squashed {
+            if probe
+                .as_ref()
+                .is_some_and(|p| squashed(repo, rev, p, &by_commit))
+            {
                 return State::Squashed;
             }
             let gone = branch.as_deref().is_some_and(|b| {

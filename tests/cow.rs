@@ -1250,3 +1250,88 @@ fn add_still_resets_an_edited_template() {
     assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
     assert!(clean(&wt));
 }
+
+#[test]
+fn force_replaces_a_template_path_git_cow_did_not_make() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let tpl = scratch.path().join("notes");
+    std::fs::create_dir(&tpl).unwrap();
+    std::fs::write(tpl.join("n.md"), "notes\n").unwrap();
+    let wt = scratch.path().join("wt");
+    let force = git_cow::Options {
+        force: true,
+        ..Default::default()
+    };
+    git_cow::add_with(
+        project.path(),
+        &tpl,
+        "origin/main",
+        &wt,
+        Some("wt"),
+        None,
+        &force,
+    )
+    .expect("--force takes the path over");
+    assert!(!tpl.join("n.md").exists());
+    assert!(tpl.join(".git").is_file());
+    assert!(clean(&wt));
+}
+
+#[test]
+fn cli_refusal_names_force_and_force_takes_the_base_over() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let base = scratch.path().join("notes");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(base.join("n.md"), "notes\n").unwrap();
+    sh(
+        project.path(),
+        &["config", "cow.base", base.to_str().unwrap()],
+    );
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let out = Command::new(bin)
+        .args(["add", "-b", "one"])
+        .arg(scratch.path().join("one"))
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--force"), "no hint in: {stderr}");
+    assert!(base.join("n.md").exists());
+
+    let st = Command::new(bin)
+        .args(["add", "--force", "-b", "two"])
+        .arg(scratch.path().join("two"))
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(!base.join("n.md").exists());
+    assert!(
+        base.join(".git").is_file(),
+        "--force did not make the extra checkout"
+    );
+}
+
+// --force keeps git's meaning: a branch checked out elsewhere is allowed
+#[test]
+fn cli_force_passes_through_to_git() {
+    let (_r, project, scratch) = setup();
+    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(["add", "--force"])
+        .arg(scratch.path().join("again"))
+        .arg("main")
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("again/a.txt")).unwrap(),
+        "a\n"
+    );
+}

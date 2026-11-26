@@ -29,7 +29,7 @@ For a different name, add an alias: `git config --global alias.wt '!git-cow'` ma
 
 | Command | What it does |
 |---|---|
-| `git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]` | Creates a worktree. Same arguments as `git worktree add`, and the path is optional. `-f` is `git worktree add --force`, and also replaces a `cow.base` path that is not an extra checkout git-cow made |
+| `git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]` | Creates a worktree. Same arguments as `git worktree add`, and the path is optional. `-f` is `git worktree add --force`, and also replaces a `cow.base` directory that holds files outside git |
 | `git cow list` | Lists your worktrees and their branches |
 | `git cow remove [--warm] [--force] <worktree>` | Removes a worktree and deletes its branch if merged. `--warm` first gives its build output to the extra checkout, `--force` removes it with uncommitted changes. It never removes the extra checkout or your main checkout. Also `rm` |
 | `git cow warm <worktree>` | Gives a worktree's build output to the extra checkout, and keeps the worktree |
@@ -82,7 +82,7 @@ git_cow::add_with(repo, checkout, "origin/main", worktree, Some("feat/x"), None,
 
 `git_cow::remove_template(repo, checkout)` removes the extra checkout, its entry in `git worktree list`, and the lock and stamp files next to it. Call it only when no `add` or `warm` on that extra checkout can run.
 
-`git_cow::add_or_plain` takes the arguments of `add_with` and runs `git worktree add` with the same path, branch and commit when cloning fails. It returns `Added::Cloned`, or `Added::Plain` with the reason the clone failed.
+`git_cow::add_or_plain` takes the arguments of `add_with` and runs `git worktree add` with the same path, branch and commit when cloning is unsupported: the volume cannot clone or the repository has submodules. It returns `Added::Cloned`, or `Added::Plain` with that reason. Any other error is returned, with no plain worktree.
 
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 
@@ -115,8 +115,8 @@ bean (Python), then `uv sync`:
 - The extra checkout can be up to an hour behind your checkout, so a new worktree may rebuild a little more.
 - Tools that store absolute paths, such as virtualenvs, point at the extra checkout after a clone.
 - A folder where every file is ignored is shared whole, hidden subfolders included, because git lists it as one entry.
-- An add fails, and leaves the path alone, when `cow.base` is a main checkout, a worktree on a branch or of another repository, or a directory with files outside git. `git cow add --force` replaces it with the extra checkout.
-- Only a volume that cannot clone and a repository with submodules fall back to `git worktree add`. Any other error stops the add, so a plain worktree never passes for a clone.
+- An add fails, and leaves the path alone, when `cow.base` is a main checkout, a worktree on a branch, or a directory with files outside git. `git cow add --force` replaces the directory with the extra checkout. A checkout is never replaced, set `cow.base` to another path.
+- Only a volume that cannot clone and a repository with submodules fall back to `git worktree add`. Any other error stops the add, such as a folder git-cow cannot write, so a plain worktree never passes for a clone.
 - A worktree path that exists and is not empty fails, as `git worktree add` refuses it too. When an add fails, git-cow deletes the `-b` branch it created, which plain git leaves behind.
 
 ## Origin

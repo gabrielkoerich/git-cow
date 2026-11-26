@@ -147,22 +147,36 @@ pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
 /// Whether a file in `src_dir` clones into `dst_dir`: both on one volume that supports it.
 /// Probed with one small file, since filesystem names miss mount options like XFS without reflink
 pub fn can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
+    probe(src_dir, dst_dir).unwrap_or(false)
+}
+
+// `can_clone`, with an error when the probe file cannot be written, such as no permission or a
+// full disk, since the user can fix that and the volume may clone fine
+fn probe(src_dir: &Path, dst_dir: &Path) -> io::Result<bool> {
     let key = (src_dir.to_path_buf(), dst_dir.to_path_buf());
     // Held through the probe, since threads probing at once would share its file names
     let mut probes = PROBES.lock().unwrap();
     if let Some(known) = probes.get(&key) {
-        return *known;
+        return Ok(*known);
     }
     let id = std::process::id();
     let src = src_dir.join(format!(".cow-probe-{id}"));
     let into = dst_dir.join(format!(".cow-probe-dir-{id}"));
-    let ok = fs::write(&src, b"x").is_ok()
-        && fs::create_dir_all(&into).is_ok()
-        && clone_into(&src, &into).is_ok();
+    let res = fs::write(&src, b"x")
+        .and_then(|()| fs::create_dir_all(&into))
+        .map(|()| clone_into(&src, &into).is_ok());
     let _ = fs::remove_file(&src);
     let _ = fs::remove_dir_all(&into);
-    probes.insert(key, ok);
-    ok
+    if let Ok(ok) = res {
+        probes.insert(key, ok);
+    }
+    res.map_err(|e| {
+        err(format!(
+            "cannot write in {} or {}: {e}",
+            src_dir.display(),
+            dst_dir.display()
+        ))
+    })
 }
 
 // A file next to the template, `.<name>.<ext>`
@@ -182,62 +196,100 @@ fn real(dir: &Path, args: &[&str]) -> Option<PathBuf> {
     git(dir, args).ok().and_then(|p| fs::canonicalize(p).ok())
 }
 
-// A path git-cow never made a template of: a non-empty directory outside git, a main checkout, a
-// worktree of another repository, or one on a branch, since templates are always detached.
-// Anything git cannot read keeps the rebuild
-fn foreign(repo: &Path, template: &Path) -> bool {
-    if !template.join(".git").exists() {
-        return occupied(template);
+// Move `template` aside, then delete it, so a delete cut short never leaves files at its path
+fn discard(template: &Path) {
+    let aside = beside(template, "trash");
+    let _ = fs::remove_dir_all(&aside);
+    if fs::rename(template, &aside).is_ok() {
+        let _ = fs::remove_dir_all(&aside);
+    } else {
+        let _ = fs::remove_dir_all(template);
     }
-    let common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
-    let (Some(gitdir), Some(tpl_common)) = (
-        real(template, &["rev-parse", "--absolute-git-dir"]),
-        real(template, &common),
-    ) else {
-        return false;
-    };
-    real(template, &["rev-parse", "--show-toplevel"]) != fs::canonicalize(template).ok()
-        || gitdir == tpl_common
-        || real(repo, &common).as_ref() != Some(&tpl_common)
-        || git(template, &["symbolic-ref", "-q", "HEAD"]).is_ok()
 }
 
-/// The error inside the `io::Error` for a template path that is not a git-cow extra checkout,
-/// left alone unless [`Options::force`] is set
+/// A template path that is not a git-cow extra checkout, inside the `io::Error` that [`add_with`],
+/// [`warm_with`] and [`remove_template`] return. They leave it alone, and only [`Options::force`]
+/// replaces [`Foreign::Files`]
 #[derive(Debug)]
-pub struct Foreign(pub PathBuf);
+pub enum Foreign {
+    /// A directory with files outside git
+    Files(PathBuf),
+    /// A main checkout, which git-cow would reset or delete
+    Checkout(PathBuf),
+    /// A worktree on this branch, while extra checkouts are always detached
+    Branch(PathBuf, String),
+}
 
 impl std::fmt::Display for Foreign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "'{}' is not a git-cow extra checkout, so it is left alone. Run git cow add with --force to replace it",
-            self.0.display()
-        )
+        match self {
+            Foreign::Files(p) => write!(
+                f,
+                "'{}' holds files and is not a git-cow extra checkout, so it is left alone. Run git cow add with --force to replace it",
+                p.display()
+            ),
+            Foreign::Checkout(p) => write!(
+                f,
+                "'{}' is a main checkout, so git-cow never uses it as its extra checkout. Set cow.base to another path",
+                p.display()
+            ),
+            Foreign::Branch(p, b) => write!(
+                f,
+                "'{}' is a worktree on branch {b}, so git-cow never uses it as its extra checkout. Set cow.base to another path",
+                p.display()
+            ),
+        }
     }
 }
 
 impl std::error::Error for Foreign {}
 
-fn not_ours(template: &Path) -> io::Error {
-    io::Error::other(Foreign(template.to_path_buf()))
+// What git-cow never made a template of. Templates are detached linked worktrees, of this or
+// another repository with the same name, and anything git cannot read keeps the rebuild
+fn foreign(template: &Path) -> Option<Foreign> {
+    let path = template.to_path_buf();
+    if !template.join(".git").exists() {
+        return occupied(template).then_some(Foreign::Files(path));
+    }
+    let (Some(gitdir), Some(common)) = (
+        real(template, &["rev-parse", "--absolute-git-dir"]),
+        real(
+            template,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ),
+    ) else {
+        return None;
+    };
+    // a `.git` git does not read as this path's own, inside some other checkout
+    if real(template, &["rev-parse", "--show-toplevel"]) != fs::canonicalize(template).ok() {
+        return Some(Foreign::Files(path));
+    }
+    if gitdir == common {
+        return Some(Foreign::Checkout(path));
+    }
+    git(template, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .ok()
+        .map(|b| Foreign::Branch(path, b))
 }
 
 // Create the template checkout, or move it to `start`
 fn refresh_template(repo: &Path, template: &Path, start: &str, force: bool) -> io::Result<()> {
-    if !force && foreign(repo, template) {
-        return Err(not_ours(template));
+    match foreign(template) {
+        Some(Foreign::Files(_)) if force => {}
+        Some(f) => return Err(io::Error::other(f)),
+        None => {}
     }
+    let _ = fs::remove_dir_all(beside(template, "trash"));
     if template.join(".git").exists()
         && git(template, &["checkout", "--detach", "--force", start]).is_ok()
     {
         return Ok(());
     }
-    let _ = fs::remove_dir_all(template);
+    discard(template);
     if clone_checkout(repo, template, start).is_ok() {
         return Ok(());
     }
-    let _ = fs::remove_dir_all(template);
+    discard(template);
     git(
         repo,
         &[
@@ -358,8 +410,8 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
-    if foreign(src, template) {
-        return Err(not_ours(template));
+    if let Some(f) = foreign(template) {
+        return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
     warm_template(src, template, &opts.share)?;
@@ -374,8 +426,8 @@ pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     if template.parent().is_none_or(|p| !p.exists()) {
         return Ok(());
     }
-    if foreign(repo, template) {
-        return Err(not_ours(template));
+    if let Some(f) = foreign(template) {
+        return Err(io::Error::other(f));
     }
     let _lock = lock_template(template)?;
     if template.join(".git").exists() {
@@ -384,7 +436,8 @@ pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
             &["worktree", "remove", "--force", &template.to_string_lossy()],
         )?;
     }
-    let _ = fs::remove_dir_all(template);
+    discard(template);
+    let _ = fs::remove_dir_all(beside(template, "trash"));
     let _ = fs::remove_dir_all(beside(template, "warm"));
     for ext in ["warmed", "lock"] {
         match fs::remove_file(beside(template, ext)) {
@@ -536,7 +589,7 @@ pub fn add_with(
         .ok_or_else(|| err("template has no parent".into()))?;
     fs::create_dir_all(wt_parent)?;
     fs::create_dir_all(tpl_parent)?;
-    if !can_clone(tpl_parent, wt_parent) {
+    if !probe(tpl_parent, wt_parent)? {
         return Err(io::Error::other(Unsupported("volume cannot clone files")));
     }
 

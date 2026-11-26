@@ -1199,9 +1199,9 @@ fn add_never_takes_over_a_template_path_it_did_not_make() {
     );
 }
 
-// A template from before the marker is a clean detached worktree, and stays usable
+// A template made outside git-cow, a detached worktree of the repo, is used as before
 #[test]
-fn add_adopts_a_clean_detached_template_without_a_marker() {
+fn add_uses_a_detached_worktree_as_the_template() {
     let (_r, project, scratch) = setup();
     if !supported(scratch.path()) {
         return;
@@ -1220,7 +1220,7 @@ fn add_adopts_a_clean_detached_template_without_a_marker() {
     );
     let wt = scratch.path().join("wt");
     git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None)
-        .expect("an old template is adopted");
+        .expect("a detached worktree is a template");
     assert!(clean(&wt));
 }
 

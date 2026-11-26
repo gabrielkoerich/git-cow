@@ -174,39 +174,28 @@ fn lock_template(template: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-// Written in the gitdir of each template git-cow makes, so it never resets or deletes another path
-const MARKER: &str = "git-cow";
-
-fn mark(template: &Path) -> io::Result<()> {
-    let gitdir = git(template, &["rev-parse", "--absolute-git-dir"])?;
-    fs::write(Path::new(&gitdir).join(MARKER), b"")
-}
-
 fn real(dir: &Path, args: &[&str]) -> Option<PathBuf> {
     git(dir, args).ok().and_then(|p| fs::canonicalize(p).ok())
 }
 
-// Whether `template` is the root of a checkout git-cow made. One from before the marker is adopted
-// when it is a detached linked worktree of `repo` with nothing to lose
-fn is_ours(repo: &Path, template: &Path) -> bool {
-    if real(template, &["rev-parse", "--show-toplevel"]) != fs::canonicalize(template).ok() {
-        return false;
-    }
-    let Some(gitdir) = real(template, &["rev-parse", "--absolute-git-dir"]) else {
-        return false;
-    };
-    if gitdir.join(MARKER).exists() {
-        return true;
+// A path git-cow never made a template of: a non-empty directory outside git, a main checkout, a
+// worktree of another repository, or one on a branch, since templates are always detached.
+// Anything git cannot read keeps the rebuild
+fn foreign(repo: &Path, template: &Path) -> bool {
+    if !template.join(".git").exists() {
+        return occupied(template);
     }
     let common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
-    let Some(tpl_common) = real(template, &common) else {
+    let (Some(gitdir), Some(tpl_common)) = (
+        real(template, &["rev-parse", "--absolute-git-dir"]),
+        real(template, &common),
+    ) else {
         return false;
     };
-    let adopt = tpl_common != gitdir
-        && real(repo, &common).as_ref() == Some(&tpl_common)
-        && git(template, &["symbolic-ref", "-q", "HEAD"]).is_err()
-        && git(template, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty());
-    adopt && mark(template).is_ok()
+    real(template, &["rev-parse", "--show-toplevel"]) != fs::canonicalize(template).ok()
+        || gitdir == tpl_common
+        || real(repo, &common).as_ref() != Some(&tpl_common)
+        || git(template, &["symbolic-ref", "-q", "HEAD"]).is_ok()
 }
 
 fn not_ours(template: &Path) -> io::Error {
@@ -218,15 +207,13 @@ fn not_ours(template: &Path) -> io::Error {
 
 // Create the template checkout, or move it to `start`
 fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
-    if template.join(".git").exists() {
-        if !is_ours(repo, template) {
-            return Err(not_ours(template));
-        }
-        if git(template, &["checkout", "--detach", "--force", start]).is_ok() {
-            return Ok(());
-        }
-    } else if occupied(template) {
+    if foreign(repo, template) {
         return Err(not_ours(template));
+    }
+    if template.join(".git").exists()
+        && git(template, &["checkout", "--detach", "--force", start]).is_ok()
+    {
+        return Ok(());
     }
     let _ = fs::remove_dir_all(template);
     if clone_checkout(repo, template, start).is_ok() {
@@ -244,7 +231,7 @@ fn refresh_template(repo: &Path, template: &Path, start: &str) -> io::Result<()>
             start,
         ],
     )?;
-    mark(template)
+    Ok(())
 }
 
 // Make the extra checkout by cloning the user's checkout, so only files that differ from `start`
@@ -269,7 +256,6 @@ fn clone_checkout(repo: &Path, template: &Path, start: &str) -> io::Result<()> {
             start,
         ],
     )?;
-    mark(template)?;
     for name in git(&top, &["ls-tree", "--name-only", "HEAD"])?.lines() {
         let src = top.join(name);
         if src.symlink_metadata().is_ok() {
@@ -354,7 +340,7 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
     if !template.join(".git").exists() {
         return Err(err(format!("no template at {}", template.display())));
     }
-    if !is_ours(src, template) {
+    if foreign(src, template) {
         return Err(not_ours(template));
     }
     let _lock = lock_template(template)?;
@@ -370,8 +356,7 @@ pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     if template.parent().is_none_or(|p| !p.exists()) {
         return Ok(());
     }
-    let has_git = template.join(".git").exists();
-    if (has_git && !is_ours(repo, template)) || (!has_git && occupied(template)) {
+    if foreign(repo, template) {
         return Err(not_ours(template));
     }
     let _lock = lock_template(template)?;

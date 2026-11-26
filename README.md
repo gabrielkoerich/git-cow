@@ -116,7 +116,7 @@ bean (Python), then `uv sync`:
 - Tools that store absolute paths, such as virtualenvs, point at the extra checkout after a clone.
 - A folder where every file is ignored is shared whole, hidden subfolders included, because git lists it as one entry.
 - Repositories with submodules always fall back.
-- git-cow resets, warms or deletes only an extra checkout it made, marked by a `git-cow` file in its gitdir. One from an older version is adopted when it is a detached worktree with no changes. Any other path at `cow.base` fails the add.
+- An add fails, and leaves the path alone, when `cow.base` is a main checkout, a worktree on a branch or of another repository, or a directory with files outside git. git-cow never makes an extra checkout there, so it never resets or deletes one.
 - A path that exists and is not empty fails with no fallback, as `git worktree add` refuses it too. When an add fails, git-cow deletes the `-b` branch it created, which plain git leaves behind.
 
 ## Origin

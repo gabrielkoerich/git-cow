@@ -1146,13 +1146,15 @@ fn cli_fails_instead_of_a_plain_add_when_cloning_errors() {
         &["config", "cow.base", file.join("p").to_str().unwrap()],
     );
     let wt = scratch.path().join("wt");
-    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+    let out = Command::new(env!("CARGO_BIN_EXE_git-cow"))
         .args(["add", "-b", "plain"])
         .arg(&wt)
         .current_dir(project.path())
-        .status()
+        .output()
         .unwrap();
-    assert!(!st.success());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("GIT_COW=0"), "no way out in: {stderr}");
     assert!(!wt.exists());
     assert!(!has_branch(project.path(), "plain"));
 }
@@ -1190,7 +1192,8 @@ fn add_never_takes_over_a_template_path_it_did_not_make() {
         let wt = scratch.path().join(format!("wt-{i}"));
         let b = format!("b-{i}");
         let res = git_cow::add(p, tpl, "origin/main", &wt, Some(&b), None);
-        assert!(res.is_err(), "{} is not a template", tpl.display());
+        let e = res.expect_err("not a template");
+        assert!(no_cli_advice(&e), "{e}");
         assert!(!wt.exists());
         assert!(
             git_cow::warm_with(p, tpl, &git_cow::Options::default()).is_err(),
@@ -1432,8 +1435,8 @@ fn force_never_takes_a_checkout_or_a_branch_worktree() {
         let b = format!("b-{i}");
         let res = git_cow::add_with(p, base, "origin/main", &wt, Some(&b), None, &force);
         let e = res.expect_err("--force must not take a checkout");
-        assert!(e.to_string().contains("cow.base"), "no hint in: {e}");
-        assert!(!e.to_string().contains("--force"), "points at --force: {e}");
+        assert!(refused_for_good(&e), "{e}");
+        assert!(no_cli_advice(&e), "{e}");
         assert!(!wt.exists());
     }
     sh(p, &["config", "cow.base", p.to_str().unwrap()]);
@@ -1444,6 +1447,11 @@ fn force_never_takes_a_checkout_or_a_branch_worktree() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cow.base") && !stderr.contains("--force"),
+        "{stderr}"
+    );
     assert_eq!(
         std::fs::read_to_string(p.join("a.txt")).unwrap(),
         "edited\n"
@@ -1541,6 +1549,19 @@ fn a_template_set_aside_for_deletion_never_blocks_an_add() {
     assert!(!tpl.exists() && !aside.exists());
 }
 
+// A refusal --force does not lift
+fn refused_for_good(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .and_then(|i| i.downcast_ref::<git_cow::Foreign>())
+        .is_some_and(|f| !matches!(f, git_cow::Foreign::Files(_)))
+}
+
+// The library leaves the advice to its caller, the CLI or another tool
+fn no_cli_advice(e: &std::io::Error) -> bool {
+    let m = e.to_string();
+    !m.contains("--force") && !m.contains("cow.base")
+}
+
 fn forced() -> git_cow::Options {
     git_cow::Options {
         force: 1,
@@ -1592,7 +1613,7 @@ fn force_never_touches_a_checkout_around_the_template() {
         &forced(),
     );
     let e = res.expect_err("tracked files are never replaced");
-    assert!(e.to_string().contains("cow.base"), "{e}");
+    assert!(refused_for_good(&e), "{e}");
     assert_eq!(
         std::fs::read_to_string(p.join("src/lib.txt")).unwrap(),
         "lib\n"
@@ -1615,7 +1636,7 @@ fn force_never_replaces_a_bare_repository() {
         &forced(),
     );
     let e = res.expect_err("a bare repository is never replaced");
-    assert!(e.to_string().contains("cow.base"), "{e}");
+    assert!(refused_for_good(&e), "{e}");
     assert!(remote.path().join("HEAD").is_file());
     sh(
         remote.path(),
@@ -1834,7 +1855,7 @@ fn force_never_deletes_checkouts_below_the_template_path() {
             &forced(),
         );
         let e = res.expect_err("a folder holding checkouts is never replaced");
-        assert!(!e.to_string().contains("--force"), "{e}");
+        assert!(refused_for_good(&e), "{e}");
     }
     assert_eq!(
         std::fs::read_to_string(inner.join("a.txt")).unwrap(),

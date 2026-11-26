@@ -1223,3 +1223,30 @@ fn add_adopts_a_clean_detached_template_without_a_marker() {
         .expect("an old template is adopted");
     assert!(clean(&wt));
 }
+
+// An old template keeps the old behavior: an edit in it is reset, never a reason to refuse it
+#[test]
+fn add_still_resets_an_edited_template() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let tpl = scratch.path().join(".git-cow/p");
+    sh(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            tpl.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    std::fs::write(tpl.join("a.txt"), "stray\n").unwrap();
+    let wt = scratch.path().join("wt");
+    git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None)
+        .expect("an edited template is reset");
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
+    assert!(clean(&wt));
+}

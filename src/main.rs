@@ -191,7 +191,28 @@ fn add(args: &[String]) -> ExitCode {
     });
     match res {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => plain(&git_args, &e.to_string()),
+        // git worktree add would refuse the path too, after creating the branch
+        Err(e) if git_cow::is_occupied(&e) => {
+            eprintln!("git-cow: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            let ours = new_branch.filter(|b| {
+                git_cow::git(
+                    &repo,
+                    &["rev-parse", "--verify", &format!("refs/heads/{b}")],
+                )
+                .is_err()
+            });
+            let code = plain(&git_args, &e.to_string());
+            // git creates the branch before it checks the path
+            if code != ExitCode::SUCCESS
+                && let Some(b) = ours
+            {
+                let _ = git_cow::git(&repo, &["branch", "-D", b]);
+            }
+            code
+        }
     }
 }
 

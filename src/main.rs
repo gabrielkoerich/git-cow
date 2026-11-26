@@ -191,6 +191,11 @@ fn add(args: &[String]) -> ExitCode {
     });
     match res {
         Ok(()) => ExitCode::SUCCESS,
+        // git worktree add would refuse the path too, after creating the branch
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("git-cow: {e}");
+            ExitCode::FAILURE
+        }
         Err(e) => plain(&git_args, &e.to_string()),
     }
 }

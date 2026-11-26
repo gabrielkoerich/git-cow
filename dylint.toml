@@ -1,0 +1,2 @@
+[workspace.metadata.dylint]
+libraries = [{ git = "https://github.com/gabrielkoerich/dylint-lints", tag = "v0.1.0", pattern = "use_in_fn" }]

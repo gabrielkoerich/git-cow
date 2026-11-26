@@ -1,0 +1,15 @@
+# Flag any function with a bool parameter, not just functions with four or more.
+# A bool argument is unreadable at the call site (report(true)) and can't grow a
+# third mode; use a two-variant enum or two methods instead.
+max-fn-params-bools = 0
+
+# Allow unwrap, expect, and printing in tests, where a panic is the assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+
+# Product names that are not code, so docs and help text keep them bare.
+doc-valid-idents = ["YubiKey", "1Password", ".."]
+
+# absolute_paths flags crate:: and external crate paths, std paths stay inline.
+absolute-paths-allowed-crates = ["std", "core", "alloc"]

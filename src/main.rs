@@ -8,10 +8,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod sweep;
+
 const USAGE: &str = "usage: git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]
        git cow list
        git cow remove [--warm] [--force] <worktree>   (or rm)
        git cow warm <worktree>
+       git cow cleanup [-n] [--yes] [--force] [<branch>]
+       git cow tree [<folder>]
        git cow share [--global] [<dir>...]
 
 add     creates a worktree as a copy-on-write clone of the extra checkout, or with git worktree
@@ -23,6 +27,10 @@ remove  removes a worktree and its branch when merged. --warm first gives its bu
         the extra checkout, --force removes it with uncommitted changes. Never removes the extra
         checkout or your main checkout
 warm    gives a worktree's gitignored directories to the extra checkout, run it after a merge
+cleanup removes worktrees and deletes branches whose work is in <branch> (default origin/HEAD),
+        merged or squash-merged, after showing the plan. -n only shows it, --yes skips the
+        question, --force also removes worktrees with changes. Locked worktrees stay
+tree    lists the worktrees of every repository in <folder>, and how far their work landed
 share   lists the hidden directories shared with every worktree, or adds to them in git config.
         Ignored directories are shared, but a hidden one only when listed, the rest is tool config
 
@@ -41,6 +49,8 @@ fn main() -> ExitCode {
         Some("remove" | "rm") => remove(&args[1..]),
         Some("warm") if args.len() == 2 => warm(Path::new(&args[1])),
         Some("share") => share(&args[1..]),
+        Some("cleanup") => sweep::cleanup(&args[1..]),
+        Some("tree") => sweep::tree(&args[1..]),
         _ => return usage(),
     };
     match res {

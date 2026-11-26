@@ -112,6 +112,8 @@ This deletes the branch when it is merged. It keeps an unmerged branch and print
 
 Leave a worktree under `<project>/.claude/worktrees` in place, unless the user asked to remove that one. Claude Code removes its own through the WorktreeRemove hook.
 
+To clear out old worktrees, run `git cow cleanup -n` in the main checkout and show the user the plan. Run `git cow cleanup --yes` only after the user agrees to it, and `--force` only after they agree to drop the changes in the worktrees it lists as `keep (has changes)`. `git cow tree ~/Projects` shows which repositories have old worktrees.
+
 `git cow warm "$path"` updates the extra checkout and leaves the worktree in place. Run it when the next worktree should start from this build and this worktree stays.
 
 ## Leave the extra checkout alone

@@ -1281,7 +1281,7 @@ fn force_replaces_a_template_path_git_cow_did_not_make() {
     std::fs::write(tpl.join("n.md"), "notes\n").unwrap();
     let wt = scratch.path().join("wt");
     let force = git_cow::Options {
-        force: true,
+        force: 1,
         ..Default::default()
     };
     git_cow::add_with(
@@ -1321,6 +1321,10 @@ fn cli_refusal_names_force_and_force_takes_the_base_over() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--force"), "no hint in: {stderr}");
+    assert!(
+        !scratch.path().join(".notes.lock").exists(),
+        "a refused add left a lock file"
+    );
     assert!(
         !out.status.success(),
         "a refused base must not fall back to git worktree add"
@@ -1407,7 +1411,7 @@ fn force_never_takes_a_checkout_or_a_branch_worktree() {
     );
     std::fs::write(user_wt.join("a.txt"), "mine\n").unwrap();
     let force = git_cow::Options {
-        force: true,
+        force: 1,
         ..Default::default()
     };
     for (i, base) in [p.to_path_buf(), user_wt.clone()].iter().enumerate() {
@@ -1482,6 +1486,11 @@ fn two_repositories_share_one_template_path() {
 #[test]
 fn unwritable_template_parent_stops_the_add() {
     use std::os::unix::fs::PermissionsExt;
+    let uid = Command::new("id").arg("-u").output().unwrap();
+    // root writes through mode 555
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        return;
+    }
     let (_r, project, scratch) = setup();
     let parent = scratch.path().join("ro");
     std::fs::create_dir(&parent).unwrap();
@@ -1517,4 +1526,247 @@ fn a_template_set_aside_for_deletion_never_blocks_an_add() {
     assert!(!aside.exists(), "the leftover was not cleaned");
     git_cow::remove_template(project.path(), &tpl).unwrap();
     assert!(!tpl.exists() && !aside.exists());
+}
+
+fn forced() -> git_cow::Options {
+    git_cow::Options {
+        force: 1,
+        ..Default::default()
+    }
+}
+
+// --force deletes the template path before any checkout runs, and never one with tracked files
+#[test]
+fn force_never_touches_a_checkout_around_the_template() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let p = project.path();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(p.join("src/lib.txt"), "lib\n").unwrap();
+    sh(p, &["add", "src"]);
+    sh(p, &["commit", "-q", "-m", "src"]);
+    std::fs::write(p.join("a.txt"), "edited\n").unwrap();
+    std::fs::create_dir_all(p.join("sub/.git")).unwrap();
+
+    let res = git_cow::add_with(
+        p,
+        &p.join("sub"),
+        "origin/main",
+        &scratch.path().join("w1"),
+        Some("w1"),
+        None,
+        &forced(),
+    );
+    assert!(
+        res.is_ok(),
+        "an empty junk .git is a directory of files: {res:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("a.txt")).unwrap(),
+        "edited\n"
+    );
+    sh(p, &["symbolic-ref", "-q", "HEAD"]);
+
+    let res = git_cow::add_with(
+        p,
+        &p.join("src"),
+        "origin/main",
+        &scratch.path().join("w2"),
+        Some("w2"),
+        None,
+        &forced(),
+    );
+    let e = res.expect_err("tracked files are never replaced");
+    assert!(e.to_string().contains("cow.base"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(p.join("src/lib.txt")).unwrap(),
+        "lib\n"
+    );
+}
+
+#[test]
+fn force_never_replaces_a_bare_repository() {
+    let (remote, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let res = git_cow::add_with(
+        project.path(),
+        remote.path(),
+        "origin/main",
+        &scratch.path().join("w"),
+        Some("w"),
+        None,
+        &forced(),
+    );
+    let e = res.expect_err("a bare repository is never replaced");
+    assert!(e.to_string().contains("cow.base"), "{e}");
+    assert!(remote.path().join("HEAD").is_file());
+    sh(
+        remote.path(),
+        &["rev-parse", "--verify", "-q", "refs/heads/main"],
+    );
+}
+
+// The lock file next to a path shows git-cow made a template there, so what is left of it is rebuilt
+#[test]
+fn a_template_left_without_git_is_rebuilt() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let tpl = scratch.path().join(".git-cow/p");
+    std::fs::create_dir_all(tpl.join("src")).unwrap();
+    std::fs::write(tpl.join("src/half.txt"), "x").unwrap();
+    std::fs::write(scratch.path().join(".git-cow/.p.lock"), "").unwrap();
+    let wt = scratch.path().join("wt");
+    git_cow::add(project.path(), &tpl, "origin/main", &wt, Some("wt"), None)
+        .expect("a leftover of git-cow's own template is rebuilt");
+    assert!(!tpl.join("src/half.txt").exists());
+    assert!(clean(&wt));
+}
+
+// A checkout git cannot read is never treated as a broken template and deleted
+#[test]
+fn a_checkout_git_cannot_read_is_left_alone() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let odd = scratch.path().join("odd");
+    std::fs::create_dir(&odd).unwrap();
+    sh(&odd, &["init", "-q"]);
+    sh(&odd, &["config", "core.repositoryformatversion", "1"]);
+    sh(&odd, &["config", "extensions.zzzunknown", "true"]);
+    std::fs::write(odd.join("u.txt"), "u\n").unwrap();
+
+    let other = scratch.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    sh(&other, &["init", "-q", "-b", "main"]);
+    sh(
+        &other,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    );
+    let mine = scratch.path().join("mine");
+    sh(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "mine",
+            mine.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(mine.join("mine.txt"), "mine\n").unwrap();
+    std::fs::rename(&other, scratch.path().join("moved")).unwrap();
+
+    for (i, base) in [&odd, &mine].iter().enumerate() {
+        let res = git_cow::add_with(
+            project.path(),
+            base,
+            "origin/main",
+            &scratch.path().join(format!("w{i}")),
+            Some(&format!("w{i}")),
+            None,
+            &forced(),
+        );
+        assert!(res.is_err(), "{} was taken", base.display());
+    }
+    assert_eq!(std::fs::read_to_string(odd.join("u.txt")).unwrap(), "u\n");
+    assert_eq!(
+        std::fs::read_to_string(mine.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn force_replaces_a_file_at_the_template_path_and_leaves_nothing_aside() {
+    let (_r, project, scratch) = setup();
+    if !supported(scratch.path()) {
+        return;
+    }
+    let tpl = scratch.path().join("tfile");
+    std::fs::write(&tpl, "x").unwrap();
+    git_cow::add_with(
+        project.path(),
+        &tpl,
+        "origin/main",
+        &scratch.path().join("w"),
+        Some("w"),
+        None,
+        &forced(),
+    )
+    .unwrap();
+    assert!(tpl.join(".git").is_file());
+    assert!(!scratch.path().join(".tfile.trash").exists());
+}
+
+// -f -f is git's way to add over a locked missing worktree, and git-cow passes it through
+#[test]
+fn cli_double_force_reaches_git() {
+    let (_r, project, scratch) = setup();
+    let lk = scratch.path().join("lk");
+    sh(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--lock",
+            "-b",
+            "lk",
+            lk.to_str().unwrap(),
+        ],
+    );
+    std::fs::rename(&lk, scratch.path().join("lk-gone")).unwrap();
+    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(["add", "-f", "-f", "-b", "lk2"])
+        .arg(&lk)
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(std::fs::read_to_string(lk.join("a.txt")).unwrap(), "a\n");
+}
+
+// Without -b, git makes a branch named after the path, and a failed add deletes it too
+#[test]
+fn failed_add_without_b_leaves_no_branch() {
+    let (_r, project, scratch) = setup();
+    let wt = scratch.path().join("gone");
+    sh(
+        project.path(),
+        &["worktree", "add", "-q", "-b", "first", wt.to_str().unwrap()],
+    );
+    std::fs::rename(&wt, scratch.path().join("elsewhere")).unwrap();
+    let res = git_cow::add_or_plain(
+        project.path(),
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &wt,
+        None,
+        None,
+        &git_cow::Options::default(),
+    );
+    assert!(res.is_err());
+    assert!(
+        !has_branch(project.path(), "gone"),
+        "a failed add left the branch git named after the path"
+    );
 }

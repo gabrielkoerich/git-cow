@@ -132,11 +132,19 @@ fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
     Ok(parent.join(".git-cow").join(repo_name(repo)?))
 }
 
+// git lists real paths while cow.base may go through a symlink, so both sides are resolved. The
+// lock file git-cow keeps beside every extra checkout also marks one
 fn is_template(repo: &Path, path: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let locked = path.file_name().is_some_and(|n| {
+        path.with_file_name(format!(".{}.lock", n.to_string_lossy()))
+            .exists()
+    });
     path.components().any(|c| c.as_os_str() == ".git-cow")
+        || locked
         || config_path(repo, "cow.base")
             .or_else(|| config_path(repo, "cow.template"))
-            .is_some_and(|t| t == path)
+            .is_some_and(|t| real(&t) == real(path))
 }
 
 #[expect(

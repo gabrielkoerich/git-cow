@@ -1115,9 +1115,9 @@ fn cli_failed_add_into_a_missing_worktree_leaves_no_branch() {
     assert!(has_branch(project.path(), "feat/login"));
 }
 
-// Only a volume that cannot clone falls back, any other error is the user's to fix
+// A clone error falls back to a plain worktree and says why, only a refused path stops the add
 #[test]
-fn add_or_plain_fails_when_the_template_parent_is_a_file() {
+fn add_or_plain_falls_back_when_the_template_parent_is_a_file() {
     let (_r, project, scratch) = setup();
     let file = scratch.path().join("not-a-dir");
     std::fs::write(&file, "x").unwrap();
@@ -1131,13 +1131,15 @@ fn add_or_plain_fails_when_the_template_parent_is_a_file() {
         None,
         &git_cow::Options::default(),
     );
-    assert!(res.is_err(), "expected an error, got {res:?}");
-    assert!(!wt.exists());
-    assert!(!has_branch(project.path(), "plain"));
+    match res {
+        Ok(git_cow::Added::Plain(why)) => assert!(!git_cow::is_unsupported(&why), "{why}"),
+        other => panic!("expected a plain add, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
 }
 
 #[test]
-fn cli_fails_instead_of_a_plain_add_when_cloning_errors() {
+fn cli_warns_and_falls_back_when_cloning_errors() {
     let (_r, project, scratch) = setup();
     let file = scratch.path().join("not-a-dir");
     std::fs::write(&file, "x").unwrap();
@@ -1152,11 +1154,11 @@ fn cli_fails_instead_of_a_plain_add_when_cloning_errors() {
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("GIT_COW=0"), "no way out in: {stderr}");
-    assert!(!wt.exists());
-    assert!(!has_branch(project.path(), "plain"));
+    assert!(stderr.contains("warning"), "no warning in: {stderr}");
+    assert!(stderr.contains("not a copy-on-write clone"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
 }
 
 // A template path that git-cow did not make must never be reset, cleaned or deleted
@@ -1503,9 +1505,9 @@ fn two_repositories_share_one_template_path() {
     }
 }
 
-// A probe that cannot write is a fixable error, not a volume without cloning
+// A probe that cannot write is a clone error, not a volume without cloning, and falls back
 #[test]
-fn unwritable_template_parent_stops_the_add() {
+fn unwritable_template_parent_falls_back_with_the_reason() {
     use std::os::unix::fs::PermissionsExt;
     let uid = Command::new("id").arg("-u").output().unwrap();
     // root writes through mode 555
@@ -1527,8 +1529,11 @@ fn unwritable_template_parent_stops_the_add() {
         &git_cow::Options::default(),
     );
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(res.is_err(), "fell back to a plain worktree: {res:?}");
-    assert!(!wt.exists());
+    match res {
+        Ok(git_cow::Added::Plain(why)) => assert!(!git_cow::is_unsupported(&why), "{why}"),
+        other => panic!("expected a plain add, got {other:?}"),
+    }
+    assert!(wt.join("a.txt").exists());
 }
 
 // git-cow moves a template aside before deleting it, so a delete cut short never leaves files at the path

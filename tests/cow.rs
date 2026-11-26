@@ -2176,16 +2176,20 @@ fn cleanup_dry_run_and_no_tty_change_nothing() {
             String::from_utf8_lossy(&out.stderr)
         );
         let plan = String::from_utf8_lossy(&out.stdout);
-        for (name, state) in [
-            ("feat-merged", "merged"),
-            ("feat-squashed", "squashed"),
-            ("feat-active", "active"),
-            ("feat-gone", "gone"),
-            ("only-squashed", "squashed"),
+        for (name, verb, state) in [
+            ("feat-merged", "remove", "merged"),
+            ("feat-squashed", "remove", "squashed"),
+            ("feat-active", "keep", "active"),
+            ("feat-gone", "keep", "gone"),
+            ("feat-dirty", "keep (has changes)", "merged"),
+            ("locked-merged", "keep (locked)", "merged"),
+            ("only-squashed", "delete", "squashed"),
+            ("only-active", "keep", "active"),
         ] {
-            assert!(
-                plan.lines().any(|l| l.contains(name) && l.contains(state)),
-                "{name} is not {state} in:\n{plan}"
+            assert_eq!(
+                planned(&plan, name),
+                Some((verb.to_string(), state.to_string())),
+                "{name} in:\n{plan}"
             );
         }
         assert!(w.wt("feat-merged").exists() && w.wt("feat-squashed").exists());
@@ -2266,4 +2270,261 @@ fn tree_lists_the_worktrees_of_every_repository_below() {
         "{text}"
     );
     assert!(w.wt("feat-squashed").exists(), "tree changed something");
+}
+
+// The verb and state cleanup planned for `branch`, from its tab separated plan
+fn planned(plan: &str, branch: &str) -> Option<(String, String)> {
+    plan.lines().find_map(|l| {
+        let cols: Vec<&str> = l.split('\t').collect();
+        (cols.len() >= 3 && cols[2] == branch).then(|| (cols[0].to_string(), cols[1].to_string()))
+    })
+}
+
+fn ok(out: &std::process::Output) -> String {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn rev(dir: &Path, r: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", r])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+// A bare clone with worktrees has no origin refs, so the base is the local main, which stays
+#[test]
+fn cleanup_keeps_the_base_branch_of_a_bare_repository() {
+    let (remote, project, scratch) = setup();
+    let s = scratch.path();
+    sh(
+        s,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remote.path().to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    let bare = s.join("bare.git");
+    sh(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            s.join("main").to_str().unwrap(),
+            "main",
+        ],
+    );
+    sh(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            s.join("feat").to_str().unwrap(),
+            "main",
+        ],
+    );
+    for dir in [s.join("main"), s.join("feat")] {
+        sh(&dir, &["config", "user.email", "t@t.com"]);
+        sh(&dir, &["config", "user.name", "T"]);
+        sh(&dir, &["config", "commit.gpgsign", "false"]);
+    }
+    commit_on(&s.join("feat"), "feat.txt");
+    sh(&s.join("main"), &["merge", "-q", "--ff-only", "feat"]);
+    commit_on(&s.join("main"), "unpushed.txt");
+    let unpushed = rev(&s.join("main"), "HEAD");
+    let _ = project;
+    ok(&cow(&s.join("main"), &["cleanup", "--yes"]));
+    assert!(
+        s.join("main/unpushed.txt").exists(),
+        "the main worktree was removed"
+    );
+    assert_eq!(
+        rev(&bare, "refs/heads/main"),
+        unpushed,
+        "main lost its unpushed commit"
+    );
+    assert!(!s.join("feat").exists(), "the merged worktree stayed");
+}
+
+// A short name resolves to a tag before a branch, so cleanup must judge refs/heads/<name>
+#[test]
+fn cleanup_judges_the_branch_not_a_tag_with_its_name() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    sh(p, &["tag", "v1", "main"]);
+    let wt = scratch.path().join("v1");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "v1",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    commit_on(&wt, "work.txt");
+    sh(p, &["branch", "v2", "main"]);
+    sh(p, &["tag", "v2", "main"]);
+    sh(p, &["checkout", "-q", "v2"]);
+    commit_on(p, "more.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(wt.join("work.txt").exists());
+    assert!(has_branch(p, "v1") && has_branch(p, "v2"));
+}
+
+// A squash merge followed by a whitespace only fix, and a branch that adds and reverts a file
+#[test]
+fn cleanup_keeps_whitespace_fixes_and_net_zero_branches() {
+    let (_r, project, _scratch) = setup();
+    let p = project.path();
+    sh(p, &["checkout", "-q", "-b", "ws"]);
+    std::fs::write(p.join("f.py"), "x = 1\n").unwrap();
+    sh(p, &["add", "f.py"]);
+    sh(p, &["commit", "-q", "-m", "f"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "ws"]);
+    sh(p, &["commit", "-q", "-m", "squash ws"]);
+    sh(p, &["checkout", "-q", "ws"]);
+    std::fs::write(p.join("f.py"), "x  = 1\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "spacing"]);
+    sh(p, &["checkout", "-q", "-b", "nz", "main"]);
+    commit_on(p, "z.txt");
+    sh(p, &["rm", "-q", "z.txt"]);
+    sh(p, &["commit", "-q", "-m", "revert z"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["commit", "-q", "--allow-empty", "-m", "trigger ci"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "ws"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "nz"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// Untracked files count as changes even when git status is told to hide them
+#[test]
+fn cleanup_sees_untracked_files_hidden_by_config() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(p, &["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(w.wt("feat-merged").join("notes.txt"), "mine\n").unwrap();
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        std::fs::read_to_string(w.wt("feat-merged").join("notes.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+// From inside a worktree, cleanup works on the whole repository but keeps the one you are in
+#[test]
+fn cleanup_from_a_worktree_keeps_it_and_the_main_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(p, &["remote", "set-head", "origin", "main"]);
+    sh(p, &["checkout", "-q", "-b", "elsewhere"]);
+    let inside = w.wt("feat-merged");
+    let plan = ok(&cow(&inside, &["cleanup", "--yes"]));
+    assert!(inside.exists(), "removed the worktree it ran in");
+    assert!(has_branch(p, "main"), "deleted the base branch");
+    assert!(!w.wt("feat-squashed").exists(), "did not clean the rest");
+    assert!(
+        plan.contains("origin/main"),
+        "the plan hides what origin/HEAD is: {plan}"
+    );
+}
+
+// Two worktrees on one branch, both merged, go together with their branch
+#[test]
+fn cleanup_handles_two_worktrees_on_one_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let twin = w.wt("twin");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-f",
+            twin.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!twin.exists() && !w.wt("feat-merged").exists());
+    assert!(!has_branch(p, "feat-merged"));
+}
+
+// A cow.base reached through a symlink is still the extra checkout, never a worktree to remove
+#[test]
+fn cleanup_knows_the_extra_checkout_behind_a_symlink() {
+    let w = sweep_setup();
+    if !supported(w.scratch.path()) {
+        return;
+    }
+    let p = w.project.path();
+    let real = w.scratch.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, w.scratch.path().join("link")).unwrap();
+    let base = w.scratch.path().join("link/tpl");
+    sh(p, &["config", "cow.base", base.to_str().unwrap()]);
+    ok(&cow(
+        p,
+        &["add", "-b", "via-link", w.wt("via-link").to_str().unwrap()],
+    ));
+    assert!(real.join("tpl/.git").is_file());
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        real.join("tpl/.git").is_file(),
+        "cleanup removed the extra checkout"
+    );
+}
+
+// tree only reads: no objects, no index writes
+#[test]
+fn tree_writes_nothing() {
+    let w = sweep_setup();
+    let objects = |d: &Path| {
+        let out = Command::new("git")
+            .args(["count-objects", "-v"])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = objects(w.project.path());
+    ok(&cow(
+        w.scratch.path(),
+        &["tree", w.project.path().to_str().unwrap()],
+    ));
+    ok(&cow(w.project.path(), &["cleanup", "-n"]));
+    assert_eq!(
+        objects(w.project.path()),
+        before,
+        "tree or a dry run wrote objects"
+    );
 }

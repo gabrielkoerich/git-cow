@@ -914,3 +914,127 @@ fn add_or_plain_clones_or_falls_back() {
     assert!(!scratch.path().join("w2-again").exists());
     sh(p, &["rev-parse", "--verify", "-q", "refs/heads/w2-again"]);
 }
+
+// Every case must fail and leave the path as it was, like git worktree add does
+#[test]
+fn add_never_deletes_an_existing_path() {
+    let (_r, project, scratch) = setup();
+    let tpl = scratch.path().join(".git-cow/p");
+    let taken = scratch.path().join("taken");
+    sh(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "first",
+            taken.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(taken.join("uncommitted.txt"), "work\n").unwrap();
+    let dir = project.path().join("notes");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("untracked.md"), "notes\n").unwrap();
+    std::fs::write(project.path().join("untracked.txt"), "work\n").unwrap();
+
+    for (wt, branch) in [
+        (&taken, Some("second")),
+        (&dir, None),
+        (&project.path().to_path_buf(), Some("x")),
+    ] {
+        let res = git_cow::add(project.path(), &tpl, "origin/main", wt, branch, None);
+        assert!(res.is_err(), "add into {} must fail", wt.display());
+        let plain = git_cow::add_or_plain(
+            project.path(),
+            &tpl,
+            "origin/main",
+            wt,
+            branch,
+            None,
+            &git_cow::Options::default(),
+        );
+        assert!(
+            plain.is_err(),
+            "add_or_plain into {} must fail",
+            wt.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(taken.join("uncommitted.txt")).unwrap(),
+        "work\n"
+    );
+    sh(&taken, &["rev-parse", "--verify", "-q", "refs/heads/first"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("untracked.md")).unwrap(),
+        "notes\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("untracked.txt")).unwrap(),
+        "work\n"
+    );
+    assert!(project.path().join(".git").is_dir());
+    for b in ["second", "x"] {
+        let out = Command::new("git")
+            .args(["branch", "--list", b])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.stdout.is_empty(),
+            "failed add must not leave branch {b}"
+        );
+    }
+}
+
+#[test]
+fn cli_fails_when_the_default_path_is_another_worktree() {
+    let (_r, project, scratch) = setup();
+    let root = scratch.path().join("wts");
+    sh(
+        project.path(),
+        &["config", "cow.root", root.to_str().unwrap()],
+    );
+    let bin = env!("CARGO_BIN_EXE_git-cow");
+    let st = Command::new(bin)
+        .args(["add", "-b", "feat/login"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let wt = root.join(project.path().file_name().unwrap()).join("login");
+    std::fs::write(wt.join("uncommitted.txt"), "work\n").unwrap();
+    let st = Command::new(bin)
+        .args(["add", "-b", "fix/login"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(!st.success(), "a second add into the same path must fail");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("uncommitted.txt")).unwrap(),
+        "work\n"
+    );
+    sh(
+        &wt,
+        &["rev-parse", "--verify", "-q", "refs/heads/feat/login"],
+    );
+}
+
+#[test]
+fn add_into_an_empty_directory_works_like_git() {
+    let (_r, project, scratch) = setup();
+    let wt = scratch.path().join("empty");
+    std::fs::create_dir(&wt).unwrap();
+    let res = git_cow::add_or_plain(
+        project.path(),
+        &scratch.path().join(".git-cow/p"),
+        "origin/main",
+        &wt,
+        Some("empty"),
+        None,
+        &git_cow::Options::default(),
+    );
+    res.expect("an empty directory is a valid target");
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
+    assert!(clean(&wt));
+}

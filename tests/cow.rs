@@ -2069,3 +2069,201 @@ fn cli_ignores_an_inherited_git_index() {
         "the user's index changed"
     );
 }
+
+// Worktrees and branches in every state cleanup tells apart, against origin/main
+struct Sweep {
+    _r: tempfile::TempDir,
+    project: tempfile::TempDir,
+    scratch: tempfile::TempDir,
+}
+
+impl Sweep {
+    fn wt(&self, name: &str) -> std::path::PathBuf {
+        self.scratch.path().join(name)
+    }
+}
+
+fn commit_on(dir: &Path, file: &str) {
+    std::fs::write(dir.join(file), format!("{file}\n")).unwrap();
+    sh(dir, &["add", file]);
+    sh(dir, &["commit", "-q", "-m", file]);
+}
+
+fn sweep_setup() -> Sweep {
+    let (r, project, scratch) = setup();
+    let p = project.path();
+    let s = scratch.path();
+    let add_wt = |name: &str| {
+        let wt = s.join(name);
+        sh(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        commit_on(&wt, &format!("{name}.txt"));
+        wt
+    };
+    let merged = add_wt("feat-merged");
+    let squashed = add_wt("feat-squashed");
+    add_wt("feat-active");
+    let dirty = add_wt("feat-dirty");
+    let gone = add_wt("feat-gone");
+    let locked = add_wt("locked-merged");
+    for b in ["only-merged", "only-squashed", "only-active"] {
+        sh(p, &["branch", b, "main"]);
+        sh(p, &["checkout", "-q", b]);
+        commit_on(p, &format!("{b}.txt"));
+        sh(p, &["checkout", "-q", "main"]);
+    }
+    sh(p, &["merge", "-q", "--ff-only", "feat-merged"]);
+    for b in ["feat-dirty", "locked-merged", "only-merged"] {
+        sh(p, &["merge", "-q", "--no-edit", b]);
+    }
+    for b in ["feat-squashed", "only-squashed"] {
+        sh(p, &["merge", "-q", "--squash", b]);
+        sh(p, &["commit", "-q", "-m", &format!("squash {b}")]);
+    }
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(&gone, &["push", "-q", "-u", "origin", "feat-gone"]);
+    sh(p, &["push", "-q", "origin", "--delete", "feat-gone"]);
+    sh(p, &["fetch", "-q", "--prune", "origin"]);
+    std::fs::write(dirty.join("notes.txt"), "keep\n").unwrap();
+    sh(p, &["worktree", "lock", locked.to_str().unwrap()]);
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            s.join("det").to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    let _ = (merged, squashed);
+    Sweep {
+        _r: r,
+        project,
+        scratch,
+    }
+}
+
+fn cow(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cleanup_dry_run_and_no_tty_change_nothing() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    for args in [&["cleanup", "-n"][..], &["cleanup"][..]] {
+        let out = cow(p, args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan = String::from_utf8_lossy(&out.stdout);
+        for (name, state) in [
+            ("feat-merged", "merged"),
+            ("feat-squashed", "squashed"),
+            ("feat-active", "active"),
+            ("feat-gone", "gone"),
+            ("only-squashed", "squashed"),
+        ] {
+            assert!(
+                plan.lines().any(|l| l.contains(name) && l.contains(state)),
+                "{name} is not {state} in:\n{plan}"
+            );
+        }
+        assert!(w.wt("feat-merged").exists() && w.wt("feat-squashed").exists());
+        assert!(has_branch(p, "only-merged"));
+    }
+    let out = cow(p, &["cleanup"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("--yes"),
+        "no hint without a terminal"
+    );
+}
+
+#[test]
+fn cleanup_removes_what_landed_and_keeps_the_rest() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let out = cow(p, &["cleanup", "--yes"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for gone in ["feat-merged", "feat-squashed", "det"] {
+        assert!(!w.wt(gone).exists(), "{gone} worktree is still there");
+    }
+    for b in [
+        "feat-merged",
+        "feat-squashed",
+        "only-merged",
+        "only-squashed",
+    ] {
+        assert!(!has_branch(p, b), "{b} branch is still there");
+    }
+    for kept in ["feat-active", "feat-dirty", "feat-gone", "locked-merged"] {
+        assert!(w.wt(kept).exists(), "{kept} worktree was removed");
+        assert!(has_branch(p, kept), "{kept} branch was deleted");
+    }
+    assert!(has_branch(p, "only-active") && has_branch(p, "main"));
+    assert_eq!(
+        std::fs::read_to_string(w.wt("feat-dirty").join("notes.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(p.join(".git").is_dir());
+
+    let out = cow(p, &["cleanup", "--yes", "--force"]);
+    assert!(out.status.success());
+    assert!(
+        !w.wt("feat-dirty").exists(),
+        "--force removes a merged worktree with changes"
+    );
+    assert!(
+        w.wt("locked-merged").exists(),
+        "a locked worktree stays even with --force"
+    );
+    assert!(w.wt("feat-active").exists());
+}
+
+#[test]
+fn tree_lists_the_worktrees_of_every_repository_below() {
+    let w = sweep_setup();
+    let out = cow(
+        w.scratch.path(),
+        &["tree", w.project.path().to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&w.project.path().display().to_string()),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("feat-squashed") && l.contains("squashed")),
+        "{text}"
+    );
+    assert!(w.wt("feat-squashed").exists(), "tree changed something");
+}

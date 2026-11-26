@@ -1,6 +1,6 @@
 //! The library and the `git cow` command against real repositories and volumes
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn sh(dir: &Path, args: &[&str]) {
@@ -2592,4 +2592,338 @@ fn tree_never_runs_a_repository_filter() {
     std::fs::write(wt.join("feat-active.txt"), "changed\n").unwrap();
     ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
     assert!(!marker.exists(), "tree ran the repository's clean filter");
+}
+
+fn spy(dir: &Path, marker: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("spy.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+// Edits git status hides, through assume-unchanged or skip-worktree, still count as changes
+#[test]
+fn cleanup_keeps_edits_hidden_from_status() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    sh(
+        &m,
+        &["update-index", "--assume-unchanged", "feat-merged.txt"],
+    );
+    std::fs::write(m.join("feat-merged.txt"), "hidden edit\n").unwrap();
+    let s = w.wt("feat-squashed");
+    sh(
+        &s,
+        &["update-index", "--skip-worktree", "feat-squashed.txt"],
+    );
+    std::fs::write(s.join("feat-squashed.txt"), "hidden edit\n").unwrap();
+    ok(&cow(w.project.path(), &["cleanup", "--yes"]));
+    assert_eq!(
+        std::fs::read_to_string(m.join("feat-merged.txt")).unwrap(),
+        "hidden edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.join("feat-squashed.txt")).unwrap(),
+        "hidden edit\n"
+    );
+}
+
+// A patch id ignores where a change sits, and a squash can be reverted: the files must match too
+#[test]
+fn cleanup_needs_the_branch_files_in_the_base() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    let block = "c1\nc2\nc3\nk\nc4\nc5\nc6\n";
+    let filler: String = (1..=10).map(|i| format!("f{i}\n")).collect();
+    std::fs::write(p.join("b.txt"), format!("{block}{filler}{block}")).unwrap();
+    sh(p, &["add", "b.txt"]);
+    sh(p, &["commit", "-q", "-m", "blocks"]);
+    sh(p, &["checkout", "-q", "-b", "blk"]);
+    let upper = block.replace("\nk\n", "\nK\n");
+    std::fs::write(p.join("b.txt"), format!("{upper}{filler}{block}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "first block"]);
+    sh(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("b.txt"), format!("{block}{filler}{upper}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "second block"]);
+    sh(p, &["checkout", "-q", "-b", "rv"]);
+    commit_on(p, "rv.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "rv"]);
+    sh(p, &["commit", "-q", "-m", "squash rv"]);
+    sh(p, &["revert", "--no-edit", "HEAD"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "blk"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "rv"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// A commit signature check and a lazy fetch both run programs from the repository's config
+#[test]
+fn tree_never_verifies_signatures_or_fetches() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("gpg-ran");
+    let script = spy(w.scratch.path(), &marker);
+    let tree = rev(p, "HEAD^{tree}");
+    let parent = rev(p, "HEAD");
+    let body = format!(
+        "tree {tree}\nparent {parent}\nauthor T <t@t.com> 1700000000 +0000\ncommitter T <t@t.com> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEz\n -----END PGP SIGNATURE-----\n\nsigned\n"
+    );
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .current_dir(p)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), body.as_bytes()).unwrap();
+    let signed = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    sh(p, &["update-ref", "refs/heads/main", signed.trim()]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    sh(p, &["config", "log.showSignature", "true"]);
+    sh(p, &["config", "gpg.program", script.to_str().unwrap()]);
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    ok(&cow(p, &["cleanup", "-n"]));
+    assert!(!marker.exists(), "a signature check ran gpg.program");
+
+    // a partial clone, where reading a branch's blobs would fetch them
+    sh(
+        w.remote.path(),
+        &["config", "uploadpack.allowFilter", "true"],
+    );
+    sh(
+        w.remote.path(),
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    sh(p, &["push", "-q", "origin", "feat-active"]);
+    let part = w.scratch.path().join("part");
+    let url = format!("file://{}", w.remote.path().display());
+    sh(
+        w.scratch.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &url,
+            part.to_str().unwrap(),
+        ],
+    );
+    sh(&part, &["branch", "feat-active", "origin/feat-active"]);
+    sh(
+        &part,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            w.scratch.path().join("pw").to_str().unwrap(),
+            "feat-active",
+        ],
+    );
+    let objects = |d: &Path| {
+        let out = Command::new("git")
+            .args(["count-objects", "-v"])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = objects(&part);
+    ok(&cow(w.scratch.path(), &["tree", part.to_str().unwrap()]));
+    ok(&cow(&part, &["cleanup", "-n"]));
+    assert_eq!(objects(&part), before, "a lazy fetch wrote objects");
+}
+
+// Worktrees whose removal loses what git keeps nowhere else stay, even with --force
+#[test]
+fn cleanup_keeps_worktrees_holding_their_own_state() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let sub = w.scratch.path().join("subrepo");
+    std::fs::create_dir(&sub).unwrap();
+    sh(&sub, &["init", "-q", "-b", "main"]);
+    sh(
+        &sub,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "s",
+        ],
+    );
+    let m = w.wt("feat-merged");
+    sh(
+        &m,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    let s = w.wt("feat-squashed");
+    sh(&s, &["update-ref", "refs/worktree/wip", "HEAD"]);
+    let det = w.wt("det");
+    let gitdir = PathBuf::from(rev(&det, "--absolute-git-dir"));
+    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
+    ok(&cow(p, &["cleanup", "--yes", "--force"]));
+    assert!(
+        m.join("sub").exists(),
+        "a worktree with a submodule was removed"
+    );
+    assert!(s.exists(), "a worktree with its own refs was removed");
+    assert!(det.exists(), "a worktree in a rebase was removed");
+}
+
+#[test]
+fn cleanup_keeps_a_worktree_whose_folder_is_missing() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    std::fs::rename(w.wt("feat-merged"), w.scratch.path().join("unmounted")).unwrap();
+    let plan = ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        planned(&plan, "feat-merged").map(|(v, _)| v),
+        Some("keep (folder missing)".into()),
+        "{plan}"
+    );
+    assert!(has_branch(p, "feat-merged"));
+}
+
+// A remote with a slash in its name, a branch named like a tag, and a branch a rebase holds
+#[test]
+fn cleanup_protects_branches_by_their_full_names() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(
+        p,
+        &[
+            "remote",
+            "add",
+            "up/stream",
+            w.remote.path().to_str().unwrap(),
+        ],
+    );
+    sh(p, &["fetch", "-q", "up/stream"]);
+    sh(p, &["checkout", "-q", "-b", "elsewhere"]);
+    let plan = ok(&cow(p, &["cleanup", "-n", "up/stream/main"]));
+    assert!(
+        planned(&plan, "main").is_none(),
+        "planned the base branch: {plan}"
+    );
+    sh(p, &["checkout", "-q", "main"]);
+
+    sh(p, &["tag", "tg", "feat-merged"]);
+    let tg = w.wt("tg");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "tg",
+            tg.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    sh(p, &["config", "branch.only-merged.remote", "origin"]);
+    let held = w.wt("feat-dirty");
+    let gitdir = PathBuf::from(rev(&held, "--absolute-git-dir"));
+    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
+    std::fs::write(
+        gitdir.join("rebase-merge/head-name"),
+        "refs/heads/only-squashed\n",
+    )
+    .unwrap();
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        !tg.exists(),
+        "a worktree on a branch named like a tag was not removed"
+    );
+    assert!(
+        has_branch(p, "only-squashed"),
+        "deleted a branch a rebase is working on"
+    );
+    let cfg = Command::new("git")
+        .args(["config", "branch.only-merged.remote"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(cfg.stdout.is_empty(), "the deleted branch kept its config");
+}
+
+// Claude Code removes its own worktrees, and a session may still run in one
+#[test]
+fn cleanup_leaves_claude_code_worktrees() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let cc = p.join(".claude/worktrees/cc");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cc",
+            cc.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(cc.exists() && has_branch(p, "cc"));
+}
+
+#[test]
+fn tree_lists_bare_repositories() {
+    let (remote, _project, scratch) = setup();
+    let s = scratch.path();
+    sh(
+        s,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remote.path().to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    sh(
+        &s.join("bare.git"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            s.join("main").to_str().unwrap(),
+            "main",
+        ],
+    );
+    let text = ok(&cow(s, &["tree", s.to_str().unwrap()]));
+    assert!(text.contains("bare.git"), "{text}");
+    assert!(text.contains("1 worktree,"), "{text}");
 }

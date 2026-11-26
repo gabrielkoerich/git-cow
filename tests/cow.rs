@@ -1115,9 +1115,9 @@ fn cli_failed_add_into_a_missing_worktree_leaves_no_branch() {
     assert!(has_branch(project.path(), "feat/login"));
 }
 
-// Only an occupied worktree path skips the fallback, not any AlreadyExists on the way
+// Only a volume that cannot clone falls back, any other error is the user's to fix
 #[test]
-fn add_or_plain_falls_back_when_the_template_parent_is_a_file() {
+fn add_or_plain_fails_when_the_template_parent_is_a_file() {
     let (_r, project, scratch) = setup();
     let file = scratch.path().join("not-a-dir");
     std::fs::write(&file, "x").unwrap();
@@ -1131,11 +1131,30 @@ fn add_or_plain_falls_back_when_the_template_parent_is_a_file() {
         None,
         &git_cow::Options::default(),
     );
-    assert!(
-        matches!(res, Ok(git_cow::Added::Plain(_))),
-        "expected a plain add, got {res:?}"
+    assert!(res.is_err(), "expected an error, got {res:?}");
+    assert!(!wt.exists());
+    assert!(!has_branch(project.path(), "plain"));
+}
+
+#[test]
+fn cli_fails_instead_of_a_plain_add_when_cloning_errors() {
+    let (_r, project, scratch) = setup();
+    let file = scratch.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    sh(
+        project.path(),
+        &["config", "cow.base", file.join("p").to_str().unwrap()],
     );
-    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
+    let wt = scratch.path().join("wt");
+    let st = Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(["add", "-b", "plain"])
+        .arg(&wt)
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(!st.success());
+    assert!(!wt.exists());
+    assert!(!has_branch(project.path(), "plain"));
 }
 
 // A template path that git-cow did not make must never be reset, cleaned or deleted

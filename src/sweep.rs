@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use git_cow::REPO_ENV;
 
@@ -289,6 +291,25 @@ fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<Probe> {
     })
 }
 
+// A new empty folder in the repository's git dir, which only its owner can write. A folder that
+// already exists is never reused, since git would read objects planted in it before the real ones
+fn scratch_dir(common: &Path) -> Option<PathBuf> {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for _ in 0..8 {
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        let dir = common.join(format!("git-cow-merge-{}-{nanos}-{n}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Some(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 // The tree of a three way merge, written to a throwaway object folder over the repository's so the
 // repository gets no new objects. None on a conflict
 fn merge_tree(repo: &Path, merge_base: &str, ours: &str, theirs: &str) -> Option<String> {
@@ -297,8 +318,7 @@ fn merge_tree(repo: &Path, merge_base: &str, ours: &str, theirs: &str) -> Option
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .ok()?;
-    let scratch = std::env::temp_dir().join(format!("git-cow-merge-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).ok()?;
+    let scratch = scratch_dir(Path::new(&common))?;
     let merge_base = format!("--merge-base={merge_base}");
     let out = git_cmd(repo)
         .env("GIT_OBJECT_DIRECTORY", &scratch)

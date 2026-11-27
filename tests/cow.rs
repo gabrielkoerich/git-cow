@@ -3214,3 +3214,76 @@ fn tree_never_runs_a_merge_driver() {
     ok(&cow(p, &["cleanup", "-n"]));
     assert!(!marker.exists(), "a merge driver ran");
 }
+
+// The cleanup library judges like the CLI, so orch and shipcheck can run it without a process
+#[test]
+fn library_plan_judges_like_the_cli() {
+    use git_cow::cleanup::{self, Action, Keep, State};
+    let w = sweep_setup();
+    let p = w.project.path();
+    let plan = cleanup::plan(p, &cleanup::Options::default()).unwrap();
+    let find = |b: &str| {
+        plan.items
+            .iter()
+            .find(|i| i.branch.as_deref() == Some(b))
+            .unwrap_or_else(|| panic!("{b} is not in the plan"))
+    };
+    assert_eq!(plan.base.name, "origin/main");
+    assert!(matches!(find("feat-merged").action, Action::Remove));
+    assert_eq!(find("feat-merged").state, State::Merged);
+    assert_eq!(find("feat-squashed").state, State::Squashed);
+    assert!(matches!(
+        find("feat-dirty").action,
+        Action::Keep(Keep::Changes)
+    ));
+    assert!(matches!(
+        find("feat-active").action,
+        Action::Keep(Keep::NotLanded)
+    ));
+    assert!(matches!(
+        find("locked-merged").action,
+        Action::Keep(Keep::Locked)
+    ));
+    assert!(find("only-squashed").path.is_none());
+    assert!(matches!(find("only-squashed").action, Action::Remove));
+    assert!(w.wt("feat-merged").exists(), "planning changed something");
+}
+
+// One worktree, as orch removes its own task worktree once the work landed
+#[test]
+fn library_removes_one_worktree_when_its_work_landed() {
+    use git_cow::cleanup::{self, Done};
+    let w = sweep_setup();
+    let p = w.project.path();
+    let opts = cleanup::Options::default();
+    let active = cleanup::plan_worktree(p, &w.wt("feat-active"), &opts).unwrap();
+    assert_eq!(active.items.len(), 1);
+    assert!(
+        cleanup::execute(&active).is_empty(),
+        "removed work that has not landed"
+    );
+    assert!(w.wt("feat-active").exists());
+
+    let old = rev(p, "refs/heads/feat-merged");
+    let one = cleanup::plan_worktree(p, &w.wt("feat-merged"), &opts).unwrap();
+    assert_eq!(one.items.len(), 1);
+    let done = cleanup::execute(&one);
+    assert!(
+        done.iter()
+            .any(|d| matches!(d, Done::Removed(path) if path.ends_with("feat-merged"))),
+        "{done:?}"
+    );
+    let backup = done
+        .iter()
+        .find_map(|d| match d {
+            Done::Deleted { branch, backup, .. } if branch == "feat-merged" => Some(backup.clone()),
+            _ => None,
+        })
+        .expect("the branch was not deleted");
+    assert_eq!(rev(p, &backup), old, "the backup does not hold the branch");
+    assert!(!w.wt("feat-merged").exists() && !has_branch(p, "feat-merged"));
+    assert!(
+        w.wt("feat-squashed").exists() && has_branch(p, "only-merged"),
+        "it went past the one worktree"
+    );
+}

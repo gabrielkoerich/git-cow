@@ -88,6 +88,24 @@ git_cow::add_with(repo, checkout, "origin/main", worktree, Some("feat/x"), None,
 
 `git_cow::add_or_plain` takes the arguments of `add_with` and runs `git worktree add` with the same path, branch and commit when cloning fails. It returns `Added::Cloned`, or `Added::Plain` with the reason. `is_unsupported` on that reason tells an expected fallback, a volume that cannot clone or a repository with submodules, from a clone that failed and is worth a warning. A path `is_refused` returns the error with no plain worktree.
 
+`git_cow::cleanup` is what `git cow cleanup` and `git cow tree` run, for tools that manage worktrees themselves:
+
+```rust
+use git_cow::cleanup::{self, Action, Done, Options};
+
+// a worktree this tool made, once its pull request merged
+let plan = cleanup::plan_worktree(repo, worktree, &Options::default())?;
+if matches!(plan.items()[0].action(), Action::Remove) {
+    for done in cleanup::execute(&plan) {
+        if let Done::Deleted { branch, backup, .. } = done {
+            println!("deleted {branch}, kept as {backup}");
+        }
+    }
+}
+```
+
+`cleanup::plan(repo, &opts)` judges every worktree and local branch, and changes nothing. `cleanup::execute(&plan)` removes what the plan marks, with the same checks and backup refs as the CLI, and returns what it did. `cleanup::survey(repo)` gives each worktree's state without reading its files, as `git cow tree` does. `Options` names the base branch and whether to remove landed worktrees with changes or a missing folder. A plan's items can be read but not changed, so `execute` only ever removes what the plan judged safe.
+
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 
 ## Benchmarks

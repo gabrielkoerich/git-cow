@@ -3224,29 +3224,29 @@ fn library_plan_judges_like_the_cli() {
     let p = w.project.path();
     let plan = cleanup::plan(p, &cleanup::Options::default()).unwrap();
     let find = |b: &str| {
-        plan.items
+        plan.items()
             .iter()
-            .find(|i| i.branch.as_deref() == Some(b))
+            .find(|i| i.branch() == Some(b))
             .unwrap_or_else(|| panic!("{b} is not in the plan"))
     };
-    assert_eq!(plan.base.name, "origin/main");
-    assert!(matches!(find("feat-merged").action, Action::Remove));
-    assert_eq!(find("feat-merged").state, State::Merged);
-    assert_eq!(find("feat-squashed").state, State::Squashed);
+    assert_eq!(plan.base().name, "origin/main");
+    assert!(matches!(find("feat-merged").action(), Action::Remove));
+    assert_eq!(find("feat-merged").state(), State::Merged);
+    assert_eq!(find("feat-squashed").state(), State::Squashed);
     assert!(matches!(
-        find("feat-dirty").action,
+        find("feat-dirty").action(),
         Action::Keep(Keep::Changes)
     ));
     assert!(matches!(
-        find("feat-active").action,
+        find("feat-active").action(),
         Action::Keep(Keep::NotLanded)
     ));
     assert!(matches!(
-        find("locked-merged").action,
+        find("locked-merged").action(),
         Action::Keep(Keep::Locked)
     ));
-    assert!(find("only-squashed").path.is_none());
-    assert!(matches!(find("only-squashed").action, Action::Remove));
+    assert!(find("only-squashed").path().is_none());
+    assert!(matches!(find("only-squashed").action(), Action::Remove));
     assert!(w.wt("feat-merged").exists(), "planning changed something");
 }
 
@@ -3257,7 +3257,7 @@ fn library_removes_one_worktree_when_its_work_landed() {
     let p = w.project.path();
     let opts = cleanup::Options::default();
     let active = cleanup::plan_worktree(p, &w.wt("feat-active"), &opts).unwrap();
-    assert_eq!(active.items.len(), 1);
+    assert_eq!(active.items().len(), 1);
     assert!(
         cleanup::execute(&active).is_empty(),
         "removed work that has not landed"
@@ -3266,7 +3266,7 @@ fn library_removes_one_worktree_when_its_work_landed() {
 
     let old = rev(p, "refs/heads/feat-merged");
     let one = cleanup::plan_worktree(p, &w.wt("feat-merged"), &opts).unwrap();
-    assert_eq!(one.items.len(), 1);
+    assert_eq!(one.items().len(), 1);
     let done = cleanup::execute(&one);
     assert!(
         done.iter()
@@ -3286,4 +3286,85 @@ fn library_removes_one_worktree_when_its_work_landed() {
         w.wt("feat-squashed").exists() && has_branch(p, "only-merged"),
         "it went past the one worktree"
     );
+}
+
+// orch removes one task worktree after another, sometimes two with one folder name at once, and
+// every commit only their reflogs held must keep its own backup
+#[test]
+fn library_backups_never_overwrite_each_other() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    let mut lost = Vec::new();
+    for side in ["a", "b"] {
+        let wt = scratch.path().join(side).join("same");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        sh(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        commit_on(&wt, &format!("{side}.txt"));
+        lost.push(rev(&wt, "HEAD"));
+        sh(&wt, &["checkout", "-q", "--detach", "main"]);
+    }
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    for side in ["a", "b"] {
+        let wt = scratch.path().join(side).join("same");
+        let plan = cleanup::plan_worktree(p, &wt, &cleanup::Options::default()).unwrap();
+        cleanup::execute(&plan);
+        assert!(!wt.exists(), "{side} stayed");
+    }
+    let backups = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/git-cow/deleted/",
+        ])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    let backups = String::from_utf8_lossy(&backups.stdout);
+    for oid in &lost {
+        assert!(
+            backups.contains(oid.as_str()),
+            "{oid} lost its backup: {backups}"
+        );
+    }
+}
+
+// One worktree's plan never counts on a branch another worktree still has
+#[test]
+fn library_plan_worktree_keeps_a_shared_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let twin = w.wt("twin");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-f",
+            twin.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    let plan = cleanup::plan_worktree(p, &twin, &cleanup::Options::default()).unwrap();
+    assert!(
+        !plan.items()[0].deletes_branch(),
+        "planned to delete a branch another worktree has"
+    );
+    let done = cleanup::execute(&plan);
+    assert!(
+        !done.iter().any(|d| matches!(d, Done::Failed { .. })),
+        "{done:?}"
+    );
+    assert!(!twin.exists() && has_branch(p, "feat-merged"));
 }

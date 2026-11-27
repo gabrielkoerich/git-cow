@@ -3,6 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_cow::cleanup::{self, Action, Done, Keep, State};
+
 fn sh(dir: &Path, args: &[&str]) {
     let st = Command::new("git")
         .args(args)
@@ -3218,7 +3220,6 @@ fn tree_never_runs_a_merge_driver() {
 // The cleanup library judges like the CLI, so orch and shipcheck can run it without a process
 #[test]
 fn library_plan_judges_like_the_cli() {
-    use git_cow::cleanup::{self, Action, Keep, State};
     let w = sweep_setup();
     let p = w.project.path();
     let plan = cleanup::plan(p, &cleanup::Options::default()).unwrap();
@@ -3252,7 +3253,6 @@ fn library_plan_judges_like_the_cli() {
 // One worktree, as orch removes its own task worktree once the work landed
 #[test]
 fn library_removes_one_worktree_when_its_work_landed() {
-    use git_cow::cleanup::{self, Done};
     let w = sweep_setup();
     let p = w.project.path();
     let opts = cleanup::Options::default();

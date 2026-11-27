@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use git_cow::cleanup::is_extra_checkout;
+
 mod sweep;
 
 const USAGE: &str = "usage: git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]
@@ -71,20 +73,6 @@ fn other(msg: String) -> std::io::Error {
     std::io::Error::other(msg)
 }
 
-// A path from git config, with ~/ and {repo} expanded
-fn config_path(repo: &Path, key: &str) -> Option<PathBuf> {
-    let v = git_cow::git(repo, &["config", "--get", key]).ok()?;
-    let v = match repo_name(repo) {
-        Ok(name) => v.replace("{repo}", &name),
-        Err(_) => v,
-    };
-    let home = std::env::var("HOME").unwrap_or_default();
-    Some(match v.strip_prefix("~/") {
-        Some(rest) => Path::new(&home).join(rest),
-        None => PathBuf::from(v),
-    })
-}
-
 fn share(args: &[String]) -> std::io::Result<()> {
     let repo = std::env::current_dir()?;
     let global = args.iter().any(|a| a == "--global");
@@ -107,44 +95,15 @@ fn share(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-// The repository's name: its directory, or a bare repository's name without `.git`
-fn repo_name(dir: &Path) -> std::io::Result<String> {
-    let common = git_cow::git(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = Path::new(&common);
-    let named = if common.file_name().is_some_and(|n| n == ".git") {
-        common.parent().unwrap_or(common)
-    } else {
-        common
-    };
-    let name = named.file_name().unwrap_or_default().to_string_lossy();
-    Ok(name.strip_suffix(".git").unwrap_or(&name).to_string())
-}
-
 fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
     // cow.template is the 0.1 name
-    if let Some(t) = config_path(repo, "cow.base").or_else(|| config_path(repo, "cow.template")) {
+    if let Some(t) = git_cow::config_path(repo, "cow.base")
+        .or_else(|| git_cow::config_path(repo, "cow.template"))
+    {
         return Ok(t);
     }
     let parent = wt.parent().unwrap_or(Path::new("."));
-    Ok(parent.join(".git-cow").join(repo_name(repo)?))
-}
-
-// git lists real paths while cow.base may go through a symlink, so both sides are resolved. The
-// lock file git-cow keeps beside every extra checkout also marks one
-fn is_template(repo: &Path, path: &Path) -> bool {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let locked = path.file_name().is_some_and(|n| {
-        path.with_file_name(format!(".{}.lock", n.to_string_lossy()))
-            .exists()
-    });
-    path.components().any(|c| c.as_os_str() == ".git-cow")
-        || locked
-        || config_path(repo, "cow.base")
-            .or_else(|| config_path(repo, "cow.template"))
-            .is_some_and(|t| real(&t) == real(path))
+    Ok(parent.join(".git-cow").join(git_cow::repo_name(repo)?))
 }
 
 #[expect(
@@ -173,16 +132,16 @@ fn add(args: &[String]) -> ExitCode {
         return usage();
     }
     if rest.is_empty() {
-        let (Some(b), Ok(name)) = (new_branch, repo_name(&repo)) else {
+        let (Some(b), Ok(name)) = (new_branch, git_cow::repo_name(&repo)) else {
             return usage();
         };
         let leaf = b.rsplit('/').next().unwrap_or(b);
         let path = match git_cow::git(&repo, &["config", "--get", "cow.root"]) {
             // a root with {repo} already names the repository's folder
-            Ok(r) if r.contains("{repo}") => config_path(&repo, "cow.root")
+            Ok(r) if r.contains("{repo}") => git_cow::config_path(&repo, "cow.root")
                 .unwrap_or_default()
                 .join(leaf),
-            _ => config_path(&repo, "cow.root")
+            _ => git_cow::config_path(&repo, "cow.root")
                 .unwrap_or_else(|| {
                     Path::new(&std::env::var("HOME").unwrap_or_default()).join(".worktrees")
                 })
@@ -321,7 +280,7 @@ fn worktrees(repo: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
 fn list() -> std::io::Result<()> {
     let repo = std::env::current_dir()?;
     for (path, branch) in worktrees(&repo)? {
-        if !is_template(&repo, &path) {
+        if !is_extra_checkout(&repo, &path) {
             println!("{}\t{branch}", path.display());
         }
     }
@@ -345,7 +304,7 @@ fn remove(args: &[String]) -> std::io::Result<()> {
             wt.display()
         )));
     };
-    if is_template(&repo, &wt) {
+    if is_extra_checkout(&repo, &wt) {
         return Err(other(format!(
             "{} is the git-cow extra checkout, not removed",
             wt.display()

@@ -12,6 +12,45 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex, PoisonError};
 
+pub mod cleanup;
+
+/// A path from git config `key` in `repo`, with `~/` and `{repo}` expanded
+pub fn config_path(repo: &Path, key: &str) -> Option<PathBuf> {
+    let v = git(repo, &["config", "--get", key]).ok()?;
+    let v = match repo_name(repo) {
+        Ok(name) => v.replace("{repo}", &name),
+        Err(_) => v,
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    Some(match v.strip_prefix("~/") {
+        Some(rest) => Path::new(&home).join(rest),
+        None => PathBuf::from(v),
+    })
+}
+
+/**
+ * The repository's name: the folder of its main checkout, or a bare repository's name without
+ * `.git`
+ *
+ * # Errors
+ *
+ * When `dir` is not in a repository
+ **/
+pub fn repo_name(dir: &Path) -> io::Result<String> {
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = Path::new(&common);
+    let named = if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent().unwrap_or(common)
+    } else {
+        common
+    };
+    let name = named.file_name().unwrap_or_default().to_string_lossy();
+    Ok(name.strip_suffix(".git").unwrap_or(&name).to_string())
+}
+
 /// Hidden directories that hold only build caches, so they are shared like any other ignored
 /// directory. Every other path with a hidden component is tool or agent config and stays out
 pub const DEFAULT_SHARE: &[&str] = &[
@@ -147,11 +186,13 @@ pub const REPO_ENV: &[&str] = &[
     "GIT_PREFIX",
 ];
 
-/// Runs git in `dir`, without [`REPO_ENV`], and returns its trimmed stdout
-///
-/// # Errors
-///
-/// When git cannot start, or exits with an error that holds its stderr
+/**
+ * Runs git in `dir`, without [`REPO_ENV`], and returns its trimmed stdout
+ *
+ * # Errors
+ *
+ * When git cannot start, or exits with an error that holds its stderr
+ **/
 pub fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
     let mut cmd = Command::new("git");
     for var in REPO_ENV {
@@ -249,9 +290,11 @@ fn made_by_git_cow(template: &Path) -> bool {
     beside(template, "lock").exists()
 }
 
-/// A template path that is not a git-cow extra checkout, inside the `io::Error` that [`add_with`],
-/// [`warm_with`] and [`remove_template`] return. They leave it alone, and only [`Options::force`]
-/// in [`add_with`] replaces [`Foreign::Files`]. The message names the path, the advice is the caller's
+/**
+ * A template path that is not a git-cow extra checkout, inside the `io::Error` that [`add_with`],
+ * [`warm_with`] and [`remove_template`] return. They leave it alone, and only [`Options::force`]
+ * in [`add_with`] replaces [`Foreign::Files`]. The message names the path, the advice is the caller's
+ **/
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Foreign {
@@ -578,21 +621,25 @@ fn warm_template(src: &Path, template: &Path, share: &[String]) -> io::Result<()
     Ok(())
 }
 
-/// Refresh an existing `template` with the gitignored directories of `src`, a checkout or a
-/// worktree whose work merged. Shares the hidden directories in [`DEFAULT_SHARE`]
-///
-/// # Errors
-///
-/// As [`warm_with`]
+/**
+ * Refresh an existing `template` with the gitignored directories of `src`, a checkout or a
+ * worktree whose work merged. Shares the hidden directories in [`DEFAULT_SHARE`]
+ *
+ * # Errors
+ *
+ * As [`warm_with`]
+ **/
 pub fn warm(src: &Path, template: &Path) -> io::Result<()> {
     warm_with(src, template, &Options::default())
 }
 
-/// [`warm`] with your own [`Options`]. It always warms, the interval only applies to [`add_with`]
-///
-/// # Errors
-///
-/// When `template` is no extra checkout or is [`Foreign`], or its lock or a git call fails
+/**
+ * [`warm`] with your own [`Options`]. It always warms, the interval only applies to [`add_with`]
+ *
+ * # Errors
+ *
+ * When `template` is no extra checkout or is [`Foreign`], or its lock or a git call fails
+ **/
 pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> {
     let template = &absolute(template)?;
     if !template.join(".git").exists() {
@@ -606,14 +653,16 @@ pub fn warm_with(src: &Path, template: &Path, opts: &Options) -> io::Result<()> 
     stamp(template)
 }
 
-/// Remove `template`, its registration in `repo`, and the lock, stamp and staging files next to it.
-/// A path that is not an extra checkout git-cow made fails with [`Foreign`] and stays. Call it
-/// only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would get a
-/// deleted file, and the next caller a new one
-///
-/// # Errors
-///
-/// When `template` is [`Foreign`], or `git worktree remove` or deleting a file fails
+/**
+ * Remove `template`, its registration in `repo`, and the lock, stamp and staging files next to it.
+ * A path that is not an extra checkout git-cow made fails with [`Foreign`] and stays. Call it
+ * only when no [`add`] or [`warm`] on this template can run: one waiting for the lock would get a
+ * deleted file, and the next caller a new one
+ *
+ * # Errors
+ *
+ * When `template` is [`Foreign`], or `git worktree remove` or deleting a file fails
+ **/
 pub fn remove_template(repo: &Path, template: &Path) -> io::Result<()> {
     let template = &absolute(template)?;
     if template.parent().is_none_or(|p| !p.exists()) {
@@ -766,13 +815,15 @@ fn populate(template: &Path, wt: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Create `wt` by cloning `template`, refreshed to `template_start` and warmed from `repo` first.
-/// `new_branch` and `commitish` are `git worktree add`'s. Like it, refuses a `wt` that exists and
-/// is not empty, and on error removes only the worktree and branch this call created
-///
-/// # Errors
-///
-/// As [`add_with`]
+/**
+ * Create `wt` by cloning `template`, refreshed to `template_start` and warmed from `repo` first.
+ * `new_branch` and `commitish` are `git worktree add`'s. Like it, refuses a `wt` that exists and
+ * is not empty, and on error removes only the worktree and branch this call created
+ *
+ * # Errors
+ *
+ * As [`add_with`]
+ **/
 pub fn add(
     repo: &Path,
     template: &Path,
@@ -792,11 +843,13 @@ pub fn add(
     )
 }
 
-/// [`add`] with your own [`Options`]
-///
-/// # Errors
-///
-/// When `wt` is [`Occupied`], the template path is [`Foreign`], cloning is [`Unsupported`], or a git or file call fails. [`is_refused`] and [`is_unsupported`] tell them apart
+/**
+ * [`add`] with your own [`Options`]
+ *
+ * # Errors
+ *
+ * When `wt` is [`Occupied`], the template path is [`Foreign`], cloning is [`Unsupported`], or a git or file call fails. [`is_refused`] and [`is_unsupported`] tell them apart
+ **/
 pub fn add_with(
     repo: &Path,
     template: &Path,
@@ -901,12 +954,14 @@ pub enum Added {
     Plain(io::Error),
 }
 
-/// [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
-/// cloning fails. A path [`is_refused`] is returned with no plain add
-///
-/// # Errors
-///
-/// When the path [`is_refused`], or the plain `git worktree add` fails too
+/**
+ * [`add_with`], or `git worktree add` with the same `wt`, `new_branch` and `commitish` when
+ * cloning fails. A path [`is_refused`] is returned with no plain add
+ *
+ * # Errors
+ *
+ * When the path [`is_refused`], or the plain `git worktree add` fails too
+ **/
 pub fn add_or_plain(
     repo: &Path,
     template: &Path,

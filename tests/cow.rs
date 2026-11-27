@@ -2934,7 +2934,7 @@ fn cleanup_keeps_an_edit_the_base_made_elsewhere_in_repeated_lines() {
     let p = project.path();
     let mut text = String::new();
     for i in 1..=9 {
-        text.push_str("u");
+        text.push('u');
         text.push_str(&i.to_string());
         text.push('\n');
     }
@@ -2948,7 +2948,9 @@ fn cleanup_keeps_an_edit_the_base_made_elsewhere_in_repeated_lines() {
         let body = std::fs::read_to_string(p.join("f.txt")).unwrap();
         let mut lines: Vec<String> = body.lines().map(String::from).collect();
         lines[line - 1] = "Y".into();
-        std::fs::write(p.join("f.txt"), lines.join("\n") + "\n").unwrap();
+        let mut joined = lines.join("\n");
+        joined.push('\n');
+        std::fs::write(p.join("f.txt"), joined).unwrap();
     };
     sh(p, &["checkout", "-q", "-b", "b"]);
     edit(20);
@@ -2969,7 +2971,8 @@ fn cleanup_keeps_an_edit_the_base_made_elsewhere_in_repeated_lines() {
     );
 }
 
-// A squash the base undid, by a revert next to another edit or inside a merge, is not landed
+// A squash the base undid, by a git revert after a nearby edit or by a commit with the reverse
+// patch, is not landed. An undo hidden in a merge goes unseen, the work stays in the squash commit
 #[test]
 fn cleanup_keeps_a_squash_the_base_undid() {
     let (_r, project, _s) = setup();
@@ -2988,17 +2991,13 @@ fn cleanup_keeps_a_squash_the_base_undid() {
     sh(p, &["commit", "-q", "-am", "edit nearby"]);
     sh(p, &["revert", "--no-edit", &squash]);
 
-    sh(p, &["checkout", "-q", "-b", "inmerge", "main"]);
+    sh(p, &["checkout", "-q", "-b", "undone", "main"]);
     commit_on(p, "m.txt");
     sh(p, &["checkout", "-q", "main"]);
-    sh(p, &["merge", "-q", "--squash", "inmerge"]);
-    sh(p, &["commit", "-q", "-m", "squash inmerge"]);
-    sh(p, &["checkout", "-q", "-b", "side", "HEAD~1"]);
-    commit_on(p, "side.txt");
-    sh(p, &["checkout", "-q", "main"]);
-    sh(p, &["merge", "-q", "--no-commit", "--no-ff", "side"]);
+    sh(p, &["merge", "-q", "--squash", "undone"]);
+    sh(p, &["commit", "-q", "-m", "squash undone"]);
     sh(p, &["rm", "-q", "m.txt"]);
-    sh(p, &["commit", "-q", "-m", "merge side, dropping m"]);
+    sh(p, &["commit", "-q", "-m", "drop m again"]);
     sh(p, &["push", "-q", "origin", "main"]);
     sh(p, &["fetch", "-q", "origin"]);
     let plan = ok(&cow(p, &["cleanup", "-n"]));
@@ -3008,7 +3007,7 @@ fn cleanup_keeps_a_squash_the_base_undid() {
         "{plan}"
     );
     assert_eq!(
-        planned(&plan, "inmerge"),
+        planned(&plan, "undone"),
         Some(("keep".into(), "active".into())),
         "{plan}"
     );

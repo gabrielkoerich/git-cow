@@ -30,6 +30,9 @@ const BUSY: &[&str] = &[
     "sequencer",
 ];
 
+// Reads attributes from the empty tree, so no merge driver or filter a repository names runs
+const NO_ATTRIBUTES: &str = "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 // Diffs compared byte for byte, without a diff program or textconv filter a repository may set
 const DIFF: &[&str] = &[
     "--no-ext-diff",
@@ -128,17 +131,28 @@ struct Worktree {
     locked: bool,
 }
 
-// The main worktree, or the bare repository, and every linked worktree after it
+// The main worktree, or the bare repository, and every linked worktree after it. Read with -z, so
+// a path holding a newline stays one path
 fn worktrees(dir: &Path) -> io::Result<(Worktree, Vec<Worktree>)> {
-    let out = run(dir, &["worktree", "list", "--porcelain"])?;
-    let mut all = out.split("\n\n").map(|block| {
+    let out = git_cmd(dir)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        return Err(other(format!(
+            "git worktree list: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut all = text.split("\0\0").filter(|b| !b.is_empty()).map(|block| {
         let mut wt = Worktree {
             path: PathBuf::new(),
             branch: None,
             head: String::new(),
             locked: false,
         };
-        for line in block.lines() {
+        for line in block.split('\0') {
             if let Some(p) = line.strip_prefix("worktree ") {
                 wt.path = PathBuf::from(p);
             } else if let Some(h) = line.strip_prefix("HEAD ") {
@@ -232,25 +246,11 @@ fn is_partial(repo: &Path) -> bool {
             .is_ok_and(|o| o.lines().any(|l| l.ends_with(" true")))
 }
 
-// The `@@` lines of a zero context diff, which say where each change sits in each file. patch-id
-// ignores them, so the same edit in another place of a file would match without this
-fn hunk_lines(repo: &Path, from: &str, to: &str) -> Option<String> {
-    let mut args = vec!["diff", "-U0"];
-    args.extend(DIFF);
-    args.extend([from, to]);
-    let out = run(repo, &args).ok()?;
-    let lines: Vec<&str> = out
-        .lines()
-        .filter(|l| l.starts_with("@@") || l.starts_with("diff --git"))
-        .collect();
-    Some(lines.join("\n"))
-}
-
 struct Probe {
     // patch ids of what the rev changed since the merge base, and of undoing it
     own: String,
     undo: String,
-    // base commits after the merge base, newest first
+    // base commits after the merge base, children before parents
     commits: String,
     mb: String,
 }
@@ -270,7 +270,17 @@ fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<Probe> {
     };
     let own = pid(&mb, rev)?;
     let undo = pid(rev, &mb)?;
-    let commits = run(repo, &["rev-list", "--no-merges", base, &format!("^{mb}")]).ok()?;
+    let commits = run(
+        repo,
+        &[
+            "rev-list",
+            "--no-merges",
+            "--topo-order",
+            base,
+            &format!("^{mb}"),
+        ],
+    )
+    .ok()?;
     Some(Probe {
         own,
         undo,
@@ -279,20 +289,90 @@ fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<Probe> {
     })
 }
 
-// A base commit after the merge base with the rev's patch, at the same places in the same files,
-// and no later base commit that undoes it
-fn squashed(repo: &Path, rev: &str, probe: &Probe, by_commit: &HashMap<String, String>) -> bool {
+// The tree of a three way merge, written to a throwaway object folder over the repository's so the
+// repository gets no new objects. None on a conflict
+fn merge_tree(repo: &Path, merge_base: &str, ours: &str, theirs: &str) -> Option<String> {
+    let common = run(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let scratch = std::env::temp_dir().join(format!("git-cow-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).ok()?;
+    let merge_base = format!("--merge-base={merge_base}");
+    let out = git_cmd(repo)
+        .env("GIT_OBJECT_DIRECTORY", &scratch)
+        .env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            Path::new(&common).join("objects"),
+        )
+        .args([
+            NO_ATTRIBUTES,
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            &merge_base,
+            ours,
+            theirs,
+        ])
+        .stderr(Stdio::null())
+        .output();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let out = out.ok().filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(String::from)
+}
+
+// Replaying the rev's change onto `c`'s parent gives exactly `c`, so `c` is its squash and not the
+// same patch made somewhere else in a file
+fn is_its_squash(repo: &Path, mb: &str, c: &str, rev: &str) -> bool {
+    let tree = run(repo, &["rev-parse", &format!("{c}^{{tree}}")]).ok();
+    tree.is_some() && merge_tree(repo, mb, &format!("{c}^"), rev) == tree
+}
+
+// A base commit after the squash `c` reverts it: git revert names it, or the patch undoes the rev.
+// An undo hidden in other work goes unseen, but the work stays in `c` in the base's history
+fn reverted(
+    repo: &Path,
+    base: &str,
+    c: &str,
+    later: &[&str],
+    undo: &str,
+    by_commit: &HashMap<String, String>,
+) -> bool {
+    later
+        .iter()
+        .any(|l| by_commit.get(*l).map(String::as_str) == Some(undo))
+        || run(
+            repo,
+            &[
+                "log",
+                "--format=%H",
+                "--fixed-strings",
+                &format!("--grep=This reverts commit {c}"),
+                base,
+                &format!("^{c}"),
+            ],
+        )
+        .is_ok_and(|out| !out.is_empty())
+}
+
+// One base commit after the merge base is the rev's squash, replayed exactly, and no later base
+// commit reverts it
+fn squashed(
+    repo: &Path,
+    base: &str,
+    rev: &str,
+    probe: &Probe,
+    by_commit: &HashMap<String, String>,
+) -> bool {
     let commits: Vec<&str> = probe.commits.lines().collect();
-    let Some(own_hunks) = hunk_lines(repo, &probe.mb, rev) else {
-        return false;
-    };
     commits.iter().enumerate().any(|(i, c)| {
         by_commit.get(*c) == Some(&probe.own)
-            && hunk_lines(repo, &format!("{c}^"), c).as_ref() == Some(&own_hunks)
-            // rev-list lists newer commits first, so an undo of the squash sits before it
-            && !commits[..i]
-                .iter()
-                .any(|later| by_commit.get(*later) == Some(&probe.undo))
+            && is_its_squash(repo, &probe.mb, c, rev)
+            && !reverted(repo, base, c, &commits[..i], &probe.undo, by_commit)
     })
 }
 
@@ -325,8 +405,8 @@ fn commit_patch_ids(repo: &Path, commits: &HashSet<&str>) -> HashMap<String, Str
     by_commit
 }
 
-// Merged is an ancestor of the base. Squashed is git-extras' check with whitespace and positions
-// counted: one base commit after the merge base made the whole change, and none undid it
+// Merged is an ancestor of the base. Squashed is git-extras' check with whitespace counted, made
+// sure by replaying the squash, and not reverted since
 fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<State> {
     let partial = is_partial(repo);
     let probes: Vec<Option<Probe>> = revs
@@ -353,7 +433,7 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
             }
             if probe
                 .as_ref()
-                .is_some_and(|p| squashed(repo, rev, p, &by_commit))
+                .is_some_and(|p| squashed(repo, &base.oid, rev, p, &by_commit))
             {
                 return State::Squashed;
             }
@@ -374,12 +454,12 @@ fn states(repo: &Path, base: &Base, revs: &[(String, Option<String>)]) -> Vec<St
 }
 
 // Edits, staged changes and every untracked file, whatever status.showUntrackedFiles says, and
-// files marked assume-unchanged or skip-worktree, whose edits git status hides
-fn has_changes(path: &Path) -> bool {
+// files marked assume-unchanged or skip-worktree, whose edits git status hides. Empty when clean
+fn changes(path: &Path) -> String {
     if !path.exists() {
-        return false;
+        return String::new();
     }
-    let status = run(
+    let mut seen = run(
         path,
         &[
             "status",
@@ -388,32 +468,106 @@ fn has_changes(path: &Path) -> bool {
             "--ignore-submodules=none",
         ],
     )
-    .is_ok_and(|s| !s.is_empty());
-    let hidden = run(path, &["ls-files", "-v"]).is_ok_and(|s| {
-        s.lines()
-            .any(|l| l.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
-    });
-    status || hidden
+    .unwrap_or_else(|e| format!("unreadable: {e}"));
+    if let Ok(files) = run(path, &["ls-files", "-v"]) {
+        for l in files
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
+        {
+            seen.push('\n');
+            seen.push_str(l);
+        }
+    }
+    seen.trim().to_string()
 }
 
-// What a worktree holds that git keeps nowhere else: submodule repositories, refs of its own, and
-// a rebase, merge or bisect in progress
-fn own_state(path: &Path) -> Option<&'static str> {
-    if !path.exists() {
-        return None;
+// A folder, or one up to `depth` levels below it, that is a repository of its own
+fn repository_below(dir: &Path, depth: u32) -> bool {
+    if dir.join(".git").exists() || (dir.join("HEAD").is_file() && dir.join("objects").is_dir()) {
+        return true;
     }
-    let submodules = path.join(".gitmodules").exists()
+    depth > 0
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.file_type().is_ok_and(|t| t.is_dir()) && repository_below(&e.path(), depth - 1)
+            })
+        })
+}
+
+// An untracked or ignored folder holding a repository, whose history a remove takes with it
+fn holds_repository(path: &Path) -> bool {
+    let Ok(out) = git_cmd(path)
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            "--ignored=traditional",
+            "--untracked-files=normal",
+        ])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|e| e.strip_prefix("?? ").or_else(|| e.strip_prefix("!! ")))
+        .filter(|p| p.ends_with('/'))
+        .any(|p| repository_below(&path.join(p), 3))
+}
+
+// Each linked worktree's admin folder in the common git dir, keyed by the worktree path its
+// `gitdir` file names
+fn admin_dirs(repo: &Path) -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    let Ok(common) = run(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return map;
+    };
+    if let Ok(entries) = std::fs::read_dir(Path::new(&common).join("worktrees")) {
+        for e in entries.flatten() {
+            if let Ok(gitfile) = std::fs::read_to_string(e.path().join("gitdir"))
+                && let Some(wt) = Path::new(gitfile.trim()).parent()
+            {
+                map.insert(wt.to_path_buf(), e.path());
+            }
+        }
+    }
+    map
+}
+
+// What a worktree holds that git keeps nowhere else: submodules and other repositories inside it,
+// refs of its own, a rebase, merge or bisect. Read from its admin folder, so a missing folder too
+fn own_state(repo: &Path, path: &Path, admin: Option<&PathBuf>) -> Option<&'static str> {
+    let Some(admin) = admin else {
+        return Some("unreadable");
+    };
+    let submodules = admin.join("modules").exists()
+        || path.join(".gitmodules").exists()
         || run(path, &["ls-files", "-s"]).is_ok_and(|s| s.lines().any(|l| l.starts_with("160000")));
     if submodules {
         return Some("has submodules");
     }
-    let Ok(gitdir) = run(path, &["rev-parse", "--absolute-git-dir"]) else {
-        return Some("unreadable");
-    };
-    if BUSY.iter().any(|f| Path::new(&gitdir).join(f).exists()) {
+    if path.exists() && holds_repository(path) {
+        return Some("holds a repository");
+    }
+    if BUSY.iter().any(|f| admin.join(f).exists()) {
         return Some("in a rebase, merge or bisect");
     }
-    if run(path, &["for-each-ref", "refs/worktree/", "refs/bisect/"]).is_ok_and(|s| !s.is_empty()) {
+    let admin = admin.to_string_lossy();
+    let refs = run(
+        repo,
+        &[
+            "--git-dir",
+            &admin,
+            "for-each-ref",
+            "refs/worktree/",
+            "refs/bisect/",
+        ],
+    );
+    if refs.is_ok_and(|s| !s.is_empty()) {
         return Some("has its own refs");
     }
     None
@@ -481,8 +635,9 @@ enum Force {
 struct Item {
     path: Option<PathBuf>,
     branch: Option<String>,
-    // the commit the plan judged, so the run skips anything that moved since
+    // the commit and the changes the plan judged, so the run skips anything that moved since
     oid: String,
+    changes: String,
     state: State,
     action: Action,
     // whether removing this worktree also deletes its branch
@@ -505,9 +660,17 @@ fn worktree_items(
     force: Force,
 ) -> Vec<Item> {
     let revs: Vec<(String, Option<String>)> = linked.iter().map(rev_of).collect();
+    let admins = admin_dirs(repo);
     let mut items = Vec::new();
     for (wt, state) in linked.iter().zip(states(repo, base, &revs)) {
-        let changes = has_changes(&wt.path);
+        let changes = changes(&wt.path);
+        let admin = admins.get(&wt.path).or_else(|| {
+            let real = std::fs::canonicalize(&wt.path).ok()?;
+            admins
+                .iter()
+                .find(|(p, _)| std::fs::canonicalize(p).is_ok_and(|q| q == real))
+                .map(|(_, a)| a)
+        });
         let inside = here.starts_with(&wt.path)
             || std::fs::canonicalize(&wt.path).is_ok_and(|p| here.starts_with(p));
         let action = if !state.landed() {
@@ -522,25 +685,27 @@ fn worktree_items(
             Action::Keep("base branch")
         } else if !wt.path.exists() && force == Force::No {
             Action::Keep("folder missing")
-        } else if let Some(why) = own_state(&wt.path) {
+        } else if let Some(why) = own_state(repo, &wt.path, admin) {
             Action::Keep(why)
-        } else if changes && force == Force::No {
+        } else if !changes.is_empty() && force == Force::No {
             Action::Keep("has changes")
         } else {
             Action::Remove
         };
+        let forced = if !changes.is_empty() || !wt.path.exists() {
+            Force::Yes
+        } else {
+            Force::No
+        };
         items.push(Item {
             path: Some(wt.path.clone()),
             branch: wt.branch.clone(),
+            changes,
             oid: wt.head.clone(),
             state,
             action,
             branch_too: false,
-            forced: if changes || !wt.path.exists() {
-                Force::Yes
-            } else {
-                Force::No
-            },
+            forced,
         });
     }
     // A branch goes with the last of its worktrees, and only when every one of them goes
@@ -583,15 +748,24 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
 
     // Local branches with no worktree, never one checked out anywhere or the base
     let checked_out: HashSet<String> = linked.iter().filter_map(|w| w.branch.clone()).collect();
+    // a symbolic ref such as master pointing at main is an alias, deleting it would delete main
     let heads = run(
         &repo,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(symref)",
+            "refs/heads/",
+        ],
     )?;
     let mut only = Vec::new();
-    for full in heads.lines() {
+    for entry in heads.lines() {
+        let (full, symref) = entry.split_once('\0').unwrap_or((entry, ""));
         let Some(b) = full.strip_prefix("refs/heads/") else {
             continue;
         };
+        if !symref.is_empty() {
+            continue;
+        }
         if checked_out.contains(b) || protected.contains(b) {
             continue;
         }
@@ -606,6 +780,7 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
         items.push(Item {
             path: None,
             branch: Some(b),
+            changes: String::new(),
             oid,
             state,
             action: if state.landed() {
@@ -635,6 +810,9 @@ fn base_of(repo: &Path) -> Option<String> {
 // One tab separated line: what happens, how far the work landed, the branch, the worktree path
 fn line(item: &Item) -> String {
     let verb = match (&item.action, &item.path) {
+        (Action::Remove, Some(_)) if !item.changes.is_empty() => {
+            "remove (discards changes)".to_string()
+        }
         (Action::Remove, Some(_)) if item.branch_too || item.branch.is_none() => {
             "remove".to_string()
         }
@@ -657,14 +835,13 @@ fn short(oid: &str) -> &str {
     oid.get(..12).unwrap_or(oid)
 }
 
-// Whether a worktree is still as the plan saw it: same commit, same branch, no new changes
+// Whether a worktree is still as the plan saw it: same commit, same branch, same changes
 fn unchanged(item: &Item, path: &Path) -> bool {
     if !path.exists() {
         return true;
     }
     let head = run(path, &["rev-parse", "HEAD"]).unwrap_or_default();
-    let branch = head_branch(path);
-    head == item.oid && branch == item.branch && (item.forced == Force::Yes || !has_changes(path))
+    head == item.oid && head_branch(path) == item.branch && changes(path) == item.changes
 }
 
 // Delete the local `b` only if it still points at `oid` and no worktree has it checked out now.
@@ -680,7 +857,16 @@ fn delete_branch(repo: &Path, b: &str, oid: &str) -> io::Result<()> {
     if busy_branches(repo).contains(b) {
         return Err(other(format!("a rebase or bisect works on {b}")));
     }
-    run(repo, &["update-ref", "-d", &format!("refs/heads/{b}"), oid])?;
+    run(
+        repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            "-d",
+            &format!("refs/heads/{b}"),
+            oid,
+        ],
+    )?;
     // git branch -D drops these too
     let _ = run(
         repo,
@@ -832,11 +1018,11 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-// git learned patch-id --verbatim in 2.39. Older git cannot tell a squash merge, so those branches
-// show as active and stay, which is safe but worth saying
+// The squash check needs patch-id --verbatim and --attr-source, both in git 2.40. Older git cannot
+// tell a squash merge, so those branches show as active and stay, which is safe but worth saying
 fn warn_without_squash_check() {
     let works = git_cmd(Path::new("."))
-        .args(["patch-id", "--verbatim"])
+        .args([NO_ATTRIBUTES, "patch-id", "--verbatim"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -844,7 +1030,7 @@ fn warn_without_squash_check() {
         .is_ok_and(|s| s.success());
     if !works {
         eprintln!(
-            "git-cow: this git is older than 2.39, so squash-merged branches show as active and stay"
+            "git-cow: this git is older than 2.40, so squash-merged branches show as active and stay"
         );
     }
 }

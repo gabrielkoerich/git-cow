@@ -2926,3 +2926,182 @@ fn tree_lists_bare_repositories() {
     assert!(text.contains("bare.git"), "{text}");
     assert!(text.contains("1 worktree,"), "{text}");
 }
+
+// Repeated lines let an unrelated edit at a shifted place look like the squash of this branch
+#[test]
+fn cleanup_keeps_an_edit_the_base_made_elsewhere_in_repeated_lines() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    let mut text = String::new();
+    for i in 1..=9 {
+        text.push_str("u");
+        text.push_str(&i.to_string());
+        text.push('\n');
+    }
+    for _ in 0..21 {
+        text.push_str("k\n");
+    }
+    std::fs::write(p.join("f.txt"), &text).unwrap();
+    sh(p, &["add", "f.txt"]);
+    sh(p, &["commit", "-q", "-m", "f"]);
+    let edit = |line: usize| {
+        let body = std::fs::read_to_string(p.join("f.txt")).unwrap();
+        let mut lines: Vec<String> = body.lines().map(String::from).collect();
+        lines[line - 1] = "Y".into();
+        std::fs::write(p.join("f.txt"), lines.join("\n") + "\n").unwrap();
+    };
+    sh(p, &["checkout", "-q", "-b", "b"]);
+    edit(20);
+    sh(p, &["commit", "-q", "-am", "b"]);
+    sh(p, &["checkout", "-q", "main"]);
+    let body = std::fs::read_to_string(p.join("f.txt")).unwrap();
+    std::fs::write(p.join("f.txt"), format!("t1\nt2\n{body}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "top"]);
+    edit(20);
+    sh(p, &["commit", "-q", "-am", "unrelated"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "b"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// A squash the base undid, by a revert next to another edit or inside a merge, is not landed
+#[test]
+fn cleanup_keeps_a_squash_the_base_undid() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    std::fs::write(p.join("g.txt"), "1\n2\n3\n4\n5\n6\n").unwrap();
+    sh(p, &["add", "g.txt"]);
+    sh(p, &["commit", "-q", "-m", "g"]);
+    sh(p, &["checkout", "-q", "-b", "near"]);
+    std::fs::write(p.join("g.txt"), "1\n2\nX\n4\n5\n6\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "near"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "near"]);
+    sh(p, &["commit", "-q", "-m", "squash near"]);
+    let squash = rev(p, "HEAD");
+    std::fs::write(p.join("g.txt"), "1\n2\nX\n4\nZ\n6\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "edit nearby"]);
+    sh(p, &["revert", "--no-edit", &squash]);
+
+    sh(p, &["checkout", "-q", "-b", "inmerge", "main"]);
+    commit_on(p, "m.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "inmerge"]);
+    sh(p, &["commit", "-q", "-m", "squash inmerge"]);
+    sh(p, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+    commit_on(p, "side.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--no-commit", "--no-ff", "side"]);
+    sh(p, &["rm", "-q", "m.txt"]);
+    sh(p, &["commit", "-q", "-m", "merge side, dropping m"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "near"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "inmerge"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// An ignored folder holding its own repository is work git status never shows
+#[test]
+fn cleanup_keeps_a_worktree_with_an_ignored_repository() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    std::fs::create_dir(m.join("out")).unwrap();
+    sh(&m.join("out"), &["init", "-q"]);
+    sh(
+        &m.join("out"),
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "mine",
+        ],
+    );
+    ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert!(
+        m.join("out/.git").is_dir(),
+        "an ignored nested repository was removed"
+    );
+}
+
+// update-ref -d through a symbolic ref deletes the branch it points to
+#[test]
+fn cleanup_skips_a_branch_that_is_a_symbolic_ref() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let main = rev(p, "refs/heads/main");
+    sh(p, &["symbolic-ref", "refs/heads/trunk", "refs/heads/main"]);
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        rev(p, "refs/heads/main"),
+        main,
+        "main was deleted through an alias"
+    );
+}
+
+// With its folder gone, a worktree's own refs live only in its admin folder
+#[test]
+fn cleanup_force_keeps_the_refs_of_a_missing_worktree() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    sh(&m, &["update-ref", "refs/worktree/save", "HEAD"]);
+    std::fs::rename(&m, w.scratch.path().join("unmounted")).unwrap();
+    let plan = ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert_eq!(
+        planned(&plan, "feat-merged").map(|(v, _)| v),
+        Some("keep (has its own refs)".into()),
+        "{plan}"
+    );
+}
+
+// --force says which worktrees lose changes, and a path with a newline is read whole
+#[test]
+fn cleanup_marks_discarded_changes_and_reads_any_path() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let plan = ok(&cow(p, &["cleanup", "-n", "--force"]));
+    assert_eq!(
+        planned(&plan, "feat-dirty").map(|(v, _)| v),
+        Some("remove (discards changes)".into()),
+        "{plan}"
+    );
+    let odd = w.scratch.path().join("odd\nname");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "odd",
+            odd.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        !odd.exists(),
+        "the worktree with a newline in its path stayed"
+    );
+    assert!(w.wt("feat-active").exists());
+}

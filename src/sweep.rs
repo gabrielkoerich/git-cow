@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -301,7 +302,7 @@ fn scratch_dir(common: &Path) -> Option<PathBuf> {
     for _ in 0..8 {
         let n = COUNT.fetch_add(1, Ordering::Relaxed);
         let dir = common.join(format!("git-cow-merge-{}-{nanos}-{n}", std::process::id()));
-        match std::fs::create_dir(&dir) {
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Some(dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return None,
@@ -318,6 +319,12 @@ fn merge_tree(repo: &Path, merge_base: &str, ours: &str, theirs: &str) -> Option
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .ok()?;
+    // --attr-source covers only the tree, info/attributes would still name a merge driver
+    let info =
+        std::fs::read_to_string(Path::new(&common).join("info/attributes")).unwrap_or_default();
+    if info.contains("merge") {
+        return None;
+    }
     let scratch = scratch_dir(Path::new(&common))?;
     let merge_base = format!("--merge-base={merge_base}");
     let out = git_cmd(repo)
@@ -328,6 +335,10 @@ fn merge_tree(repo: &Path, merge_base: &str, ours: &str, theirs: &str) -> Option
         )
         .args([
             NO_ATTRIBUTES,
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "merge.default=text",
             "merge-tree",
             "--write-tree",
             "--no-messages",
@@ -501,17 +512,25 @@ fn changes(path: &Path) -> String {
     seen.trim().to_string()
 }
 
-// A folder, or one up to `depth` levels below it, that is a repository of its own
-fn repository_below(dir: &Path, depth: u32) -> bool {
-    if dir.join(".git").exists() || (dir.join("HEAD").is_file() && dir.join("objects").is_dir()) {
-        return true;
+// A folder, or any folder below it, that is a repository of its own. Symlinks are not followed,
+// since removing the worktree removes only the link
+fn repository_below(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if d.join(".git").exists() || (d.join("HEAD").is_file() && d.join("objects").is_dir()) {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        stack.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path()),
+        );
     }
-    depth > 0
-        && std::fs::read_dir(dir).is_ok_and(|entries| {
-            entries.flatten().any(|e| {
-                e.file_type().is_ok_and(|t| t.is_dir()) && repository_below(&e.path(), depth - 1)
-            })
-        })
+    false
 }
 
 // An untracked or ignored folder holding a repository, whose history a remove takes with it
@@ -529,11 +548,13 @@ fn holds_repository(path: &Path) -> bool {
     else {
         return true;
     };
-    String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter_map(|e| e.strip_prefix("?? ").or_else(|| e.strip_prefix("!! ")))
-        .filter(|p| p.ends_with('/'))
-        .any(|p| repository_below(&path.join(p), 3))
+    // a status that fails hides what is inside, so it counts as holding one
+    !out.status.success()
+        || String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|e| e.strip_prefix("?? ").or_else(|| e.strip_prefix("!! ")))
+            .filter(|p| p.ends_with('/'))
+            .any(|p| repository_below(&path.join(p)))
 }
 
 // Each linked worktree's admin folder in the common git dir, keyed by the worktree path its
@@ -663,6 +684,8 @@ struct Item {
     // whether removing this worktree also deletes its branch
     branch_too: bool,
     forced: Force,
+    // the worktree's admin folder, whose HEAD reflog may hold commits no ref has
+    admin: Option<PathBuf>,
 }
 
 struct Plan {
@@ -726,6 +749,7 @@ fn worktree_items(
             action,
             branch_too: false,
             forced,
+            admin: admin.cloned(),
         });
     }
     // A branch goes with the last of its worktrees, and only when every one of them goes
@@ -760,14 +784,14 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
         protected.extend(base_of(&repo));
     }
     protected.extend(busy_branches(&repo));
+    // Local branches with no worktree, never one checked out anywhere, an extra checkout too
+    let checked_out: HashSet<String> = linked.iter().filter_map(|w| w.branch.clone()).collect();
     let linked: Vec<Worktree> = linked
         .into_iter()
         .filter(|w| !is_template(&repo, &w.path))
         .collect();
     let mut items = worktree_items(&repo, &base, &linked, &protected, &here, force);
 
-    // Local branches with no worktree, never one checked out anywhere or the base
-    let checked_out: HashSet<String> = linked.iter().filter_map(|w| w.branch.clone()).collect();
     // a symbolic ref such as master pointing at main is an alias, deleting it would delete main
     let heads = run(
         &repo,
@@ -810,6 +834,7 @@ fn plan(dir: &Path, named: Option<&str>, force: Force) -> io::Result<Plan> {
             },
             branch_too: true,
             forced: Force::No,
+            admin: None,
         });
     }
     Ok(Plan { repo, base, items })
@@ -864,9 +889,56 @@ fn unchanged(item: &Item, path: &Path) -> bool {
     head == item.oid && head_branch(path) == item.branch && changes(path) == item.changes
 }
 
-// Delete the local `b` only if it still points at `oid` and no worktree has it checked out now.
-// Only refs/heads changes, a remote is never touched
-fn delete_branch(repo: &Path, b: &str, oid: &str) -> io::Result<()> {
+// Where cleanup keeps every commit it lets go of, one folder per run, so gc never prunes them
+const BACKUP: &str = "refs/git-cow/deleted";
+
+// A worktree folder name as a ref name part
+fn ref_part(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "worktree".into()
+    } else {
+        clean
+    }
+}
+
+// Commits only the worktree's HEAD reflog holds, saved before git deletes that reflog with it
+fn back_up_reflog(repo: &Path, admin: &Path, name: &str, stamp: &str) -> io::Result<()> {
+    let admin = admin.to_string_lossy();
+    let Ok(log) = run(
+        repo,
+        &["--git-dir", &admin, "reflog", "show", "--format=%H", "HEAD"],
+    ) else {
+        return Ok(());
+    };
+    let oids: HashSet<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    if oids.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["rev-list"];
+    args.extend(oids.iter());
+    args.extend(["--not", "--branches", "--tags", "--remotes"]);
+    let unreachable = run(repo, &args)?;
+    let lost = unreachable.lines().filter(|o| oids.contains(o));
+    for (i, oid) in lost.enumerate() {
+        let backup = format!("{BACKUP}/{stamp}/worktree/{}/{i}", ref_part(name));
+        run(repo, &["update-ref", &backup, oid])?;
+    }
+    Ok(())
+}
+
+// Delete the local `b` only if it still points at `oid` and no worktree has it checked out now,
+// after saving it under the backup refs. Only refs/heads changes, a remote is never touched
+fn delete_branch(repo: &Path, b: &str, oid: &str, stamp: &str) -> io::Result<String> {
     let (main, linked) = worktrees(repo)?;
     if std::iter::once(&main)
         .chain(&linked)
@@ -877,6 +949,8 @@ fn delete_branch(repo: &Path, b: &str, oid: &str) -> io::Result<()> {
     if busy_branches(repo).contains(b) {
         return Err(other(format!("a rebase or bisect works on {b}")));
     }
+    let backup = format!("{BACKUP}/{stamp}/branch/{b}");
+    run(repo, &["update-ref", &backup, oid])?;
     run(
         repo,
         &[
@@ -892,7 +966,7 @@ fn delete_branch(repo: &Path, b: &str, oid: &str) -> io::Result<()> {
         repo,
         &["config", "--remove-section", &format!("branch.{b}")],
     );
-    Ok(())
+    Ok(backup)
 }
 
 struct Mode {
@@ -919,12 +993,24 @@ fn confirm(mode: &Mode) -> io::Result<bool> {
 }
 
 fn execute(repo: &Path, removals: &[&Item]) -> usize {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let stamp = format!("{secs}-{}", std::process::id());
     let mut failed = 0;
     for item in removals {
         if let Some(path) = &item.path {
             let p = path.to_string_lossy();
             if !unchanged(item, path) {
                 eprintln!("git-cow: kept {p}, it changed since the plan");
+                failed += 1;
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if let Some(admin) = &item.admin
+                && let Err(e) = back_up_reflog(repo, admin, &name, &stamp)
+            {
+                eprintln!("git-cow: kept {p}, its reflog could not be backed up: {e}");
                 failed += 1;
                 continue;
             }
@@ -941,11 +1027,10 @@ fn execute(repo: &Path, removals: &[&Item]) -> usize {
             println!("removed {p}");
         }
         if let (Some(b), true) = (&item.branch, item.branch_too) {
-            match delete_branch(repo, b, &item.oid) {
-                Ok(()) => println!(
-                    "deleted {b} (was {}, git branch {b} {} restores it)",
-                    short(&item.oid),
-                    item.oid
+            match delete_branch(repo, b, &item.oid, &stamp) {
+                Ok(backup) => println!(
+                    "deleted {b} (was {}, git branch {b} {backup} restores it)",
+                    short(&item.oid)
                 ),
                 Err(e) => {
                     eprintln!("git-cow: kept branch {b}: {e}");

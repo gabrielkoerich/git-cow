@@ -8,10 +8,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod sweep;
+
 const USAGE: &str = "usage: git cow add [-f] [-b <branch>] [<path>] [<commit-ish>]
        git cow list
        git cow remove [--warm] [--force] <worktree>   (or rm)
        git cow warm <worktree>
+       git cow cleanup [-n] [--yes] [--force] [<branch>]
+       git cow tree [<folder>]
        git cow share [--global] [<dir>...]
 
 add     creates a worktree as a copy-on-write clone of the extra checkout, or with git worktree
@@ -23,6 +27,10 @@ remove  removes a worktree and its branch when merged. --warm first gives its bu
         the extra checkout, --force removes it with uncommitted changes. Never removes the extra
         checkout or your main checkout
 warm    gives a worktree's gitignored directories to the extra checkout, run it after a merge
+cleanup removes worktrees and deletes branches whose work is in <branch> (default origin/HEAD),
+        merged or squash-merged, after showing the plan. -n only shows it, --yes skips the
+        question, --force also removes worktrees with changes. Locked worktrees stay
+tree    lists the worktrees of every repository in <folder>, and how far their work landed
 share   lists the hidden directories shared with every worktree, or adds to them in git config.
         Ignored directories are shared, but a hidden one only when listed, the rest is tool config
 
@@ -41,6 +49,8 @@ fn main() -> ExitCode {
         Some("remove" | "rm") => remove(&args[1..]),
         Some("warm") if args.len() == 2 => warm(Path::new(&args[1])),
         Some("share") => share(&args[1..]),
+        Some("cleanup") => sweep::cleanup(&args[1..]),
+        Some("tree") => sweep::tree(&args[1..]),
         _ => return usage(),
     };
     match res {
@@ -122,11 +132,19 @@ fn template_for(repo: &Path, wt: &Path) -> std::io::Result<PathBuf> {
     Ok(parent.join(".git-cow").join(repo_name(repo)?))
 }
 
+// git lists real paths while cow.base may go through a symlink, so both sides are resolved. The
+// lock file git-cow keeps beside every extra checkout also marks one
 fn is_template(repo: &Path, path: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let locked = path.file_name().is_some_and(|n| {
+        path.with_file_name(format!(".{}.lock", n.to_string_lossy()))
+            .exists()
+    });
     path.components().any(|c| c.as_os_str() == ".git-cow")
+        || locked
         || config_path(repo, "cow.base")
             .or_else(|| config_path(repo, "cow.template"))
-            .is_some_and(|t| t == path)
+            .is_some_and(|t| real(&t) == real(path))
 }
 
 #[expect(

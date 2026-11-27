@@ -1,6 +1,6 @@
 //! The library and the `git cow` command against real repositories and volumes
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn sh(dir: &Path, args: &[&str]) {
@@ -2068,4 +2068,1149 @@ fn cli_ignores_an_inherited_git_index() {
         "staged.txt",
         "the user's index changed"
     );
+}
+
+// Worktrees and branches in every state cleanup tells apart, against origin/main
+struct Sweep {
+    remote: tempfile::TempDir,
+    project: tempfile::TempDir,
+    scratch: tempfile::TempDir,
+}
+
+impl Sweep {
+    fn wt(&self, name: &str) -> std::path::PathBuf {
+        self.scratch.path().join(name)
+    }
+}
+
+fn commit_on(dir: &Path, file: &str) {
+    std::fs::write(dir.join(file), format!("{file}\n")).unwrap();
+    sh(dir, &["add", file]);
+    sh(dir, &["commit", "-q", "-m", file]);
+}
+
+fn sweep_setup() -> Sweep {
+    let (r, project, scratch) = setup();
+    let p = project.path();
+    let s = scratch.path();
+    let add_wt = |name: &str| {
+        let wt = s.join(name);
+        sh(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        commit_on(&wt, &format!("{name}.txt"));
+        wt
+    };
+    let merged = add_wt("feat-merged");
+    let squashed = add_wt("feat-squashed");
+    add_wt("feat-active");
+    let dirty = add_wt("feat-dirty");
+    let gone = add_wt("feat-gone");
+    let locked = add_wt("locked-merged");
+    for b in ["only-merged", "only-squashed", "only-active"] {
+        sh(p, &["branch", b, "main"]);
+        sh(p, &["checkout", "-q", b]);
+        commit_on(p, &format!("{b}.txt"));
+        sh(p, &["checkout", "-q", "main"]);
+    }
+    sh(p, &["merge", "-q", "--ff-only", "feat-merged"]);
+    for b in ["feat-dirty", "locked-merged", "only-merged"] {
+        sh(p, &["merge", "-q", "--no-edit", b]);
+    }
+    for b in ["feat-squashed", "only-squashed"] {
+        sh(p, &["merge", "-q", "--squash", b]);
+        sh(p, &["commit", "-q", "-m", &format!("squash {b}")]);
+    }
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(&gone, &["push", "-q", "-u", "origin", "feat-gone"]);
+    sh(p, &["push", "-q", "origin", "--delete", "feat-gone"]);
+    sh(p, &["fetch", "-q", "--prune", "origin"]);
+    std::fs::write(dirty.join("notes.txt"), "keep\n").unwrap();
+    sh(p, &["worktree", "lock", locked.to_str().unwrap()]);
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            s.join("det").to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    let _ = (merged, squashed);
+    Sweep {
+        remote: r,
+        project,
+        scratch,
+    }
+}
+
+fn cow(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_git-cow"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cleanup_dry_run_and_no_tty_change_nothing() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    for args in [&["cleanup", "-n"][..], &["cleanup"][..]] {
+        let out = cow(p, args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan = String::from_utf8_lossy(&out.stdout);
+        for (name, verb, state) in [
+            ("feat-merged", "remove", "merged"),
+            ("feat-squashed", "remove", "squashed"),
+            ("feat-active", "keep", "active"),
+            ("feat-gone", "keep", "gone"),
+            ("feat-dirty", "keep (has changes)", "merged"),
+            ("locked-merged", "keep (locked)", "merged"),
+            ("only-squashed", "delete", "squashed"),
+            ("only-active", "keep", "active"),
+        ] {
+            assert_eq!(
+                planned(&plan, name),
+                Some((verb.to_string(), state.to_string())),
+                "{name} in:\n{plan}"
+            );
+        }
+        assert!(w.wt("feat-merged").exists() && w.wt("feat-squashed").exists());
+        assert!(has_branch(p, "only-merged"));
+    }
+    let out = cow(p, &["cleanup"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("--yes"),
+        "no hint without a terminal"
+    );
+}
+
+#[test]
+fn cleanup_removes_what_landed_and_keeps_the_rest() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let out = cow(p, &["cleanup", "--yes"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for gone in ["feat-merged", "feat-squashed", "det"] {
+        assert!(!w.wt(gone).exists(), "{gone} worktree is still there");
+    }
+    for b in [
+        "feat-merged",
+        "feat-squashed",
+        "only-merged",
+        "only-squashed",
+    ] {
+        assert!(!has_branch(p, b), "{b} branch is still there");
+    }
+    for kept in ["feat-active", "feat-dirty", "feat-gone", "locked-merged"] {
+        assert!(w.wt(kept).exists(), "{kept} worktree was removed");
+        assert!(has_branch(p, kept), "{kept} branch was deleted");
+    }
+    assert!(has_branch(p, "only-active") && has_branch(p, "main"));
+    assert_eq!(
+        std::fs::read_to_string(w.wt("feat-dirty").join("notes.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(p.join(".git").is_dir());
+
+    let out = cow(p, &["cleanup", "--yes", "--force"]);
+    assert!(out.status.success());
+    assert!(
+        !w.wt("feat-dirty").exists(),
+        "--force removes a merged worktree with changes"
+    );
+    assert!(
+        w.wt("locked-merged").exists(),
+        "a locked worktree stays even with --force"
+    );
+    assert!(w.wt("feat-active").exists());
+}
+
+#[test]
+fn tree_lists_the_worktrees_of_every_repository_below() {
+    let w = sweep_setup();
+    let out = cow(
+        w.scratch.path(),
+        &["tree", w.project.path().to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&w.project.path().display().to_string()),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("feat-squashed") && l.contains("squashed")),
+        "{text}"
+    );
+    assert!(w.wt("feat-squashed").exists(), "tree changed something");
+}
+
+// The verb and state cleanup planned for `branch`, from its tab separated plan
+fn planned(plan: &str, branch: &str) -> Option<(String, String)> {
+    plan.lines().find_map(|l| {
+        let cols: Vec<&str> = l.split('\t').collect();
+        (cols.len() >= 3 && cols[2] == branch).then(|| (cols[0].to_string(), cols[1].to_string()))
+    })
+}
+
+fn ok(out: &std::process::Output) -> String {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn rev(dir: &Path, r: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", r])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+// A bare clone with worktrees has no origin refs, so the base is the local main, which stays
+#[test]
+fn cleanup_keeps_the_base_branch_of_a_bare_repository() {
+    let (remote, project, scratch) = setup();
+    let s = scratch.path();
+    sh(
+        s,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remote.path().to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    let bare = s.join("bare.git");
+    sh(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            s.join("main").to_str().unwrap(),
+            "main",
+        ],
+    );
+    sh(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            s.join("feat").to_str().unwrap(),
+            "main",
+        ],
+    );
+    for dir in [s.join("main"), s.join("feat")] {
+        sh(&dir, &["config", "user.email", "t@t.com"]);
+        sh(&dir, &["config", "user.name", "T"]);
+        sh(&dir, &["config", "commit.gpgsign", "false"]);
+    }
+    commit_on(&s.join("feat"), "feat.txt");
+    sh(&s.join("main"), &["merge", "-q", "--ff-only", "feat"]);
+    commit_on(&s.join("main"), "unpushed.txt");
+    let unpushed = rev(&s.join("main"), "HEAD");
+    let _ = project;
+    ok(&cow(&s.join("main"), &["cleanup", "--yes"]));
+    assert!(
+        s.join("main/unpushed.txt").exists(),
+        "the main worktree was removed"
+    );
+    assert_eq!(
+        rev(&bare, "refs/heads/main"),
+        unpushed,
+        "main lost its unpushed commit"
+    );
+    assert!(!s.join("feat").exists(), "the merged worktree stayed");
+}
+
+// A short name resolves to a tag before a branch, so cleanup must judge refs/heads/<name>
+#[test]
+fn cleanup_judges_the_branch_not_a_tag_with_its_name() {
+    let (_r, project, scratch) = setup();
+    let p = project.path();
+    sh(p, &["tag", "v1", "main"]);
+    let wt = scratch.path().join("v1");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "v1",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    commit_on(&wt, "work.txt");
+    sh(p, &["branch", "v2", "main"]);
+    sh(p, &["tag", "v2", "main"]);
+    sh(p, &["checkout", "-q", "v2"]);
+    commit_on(p, "more.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(wt.join("work.txt").exists());
+    assert!(has_branch(p, "v1") && has_branch(p, "v2"));
+}
+
+// A squash merge followed by a whitespace only fix, and a branch that adds and reverts a file
+#[test]
+fn cleanup_keeps_whitespace_fixes_and_net_zero_branches() {
+    let (_r, project, _scratch) = setup();
+    let p = project.path();
+    sh(p, &["checkout", "-q", "-b", "ws"]);
+    std::fs::write(p.join("f.py"), "x = 1\n").unwrap();
+    sh(p, &["add", "f.py"]);
+    sh(p, &["commit", "-q", "-m", "f"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "ws"]);
+    sh(p, &["commit", "-q", "-m", "squash ws"]);
+    sh(p, &["checkout", "-q", "ws"]);
+    std::fs::write(p.join("f.py"), "x  = 1\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "spacing"]);
+    sh(p, &["checkout", "-q", "-b", "nz", "main"]);
+    commit_on(p, "z.txt");
+    sh(p, &["rm", "-q", "z.txt"]);
+    sh(p, &["commit", "-q", "-m", "revert z"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["commit", "-q", "--allow-empty", "-m", "trigger ci"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "ws"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "nz"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// Untracked files count as changes even when git status is told to hide them
+#[test]
+fn cleanup_sees_untracked_files_hidden_by_config() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(p, &["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(w.wt("feat-merged").join("notes.txt"), "mine\n").unwrap();
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        std::fs::read_to_string(w.wt("feat-merged").join("notes.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+// From inside a worktree, cleanup works on the whole repository but keeps the one you are in
+#[test]
+fn cleanup_from_a_worktree_keeps_it_and_the_main_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(p, &["remote", "set-head", "origin", "main"]);
+    sh(p, &["checkout", "-q", "-b", "elsewhere"]);
+    let inside = w.wt("feat-merged");
+    let plan = ok(&cow(&inside, &["cleanup", "--yes"]));
+    assert!(inside.exists(), "removed the worktree it ran in");
+    assert!(has_branch(p, "main"), "deleted the base branch");
+    assert!(!w.wt("feat-squashed").exists(), "did not clean the rest");
+    assert!(
+        plan.contains("origin/main"),
+        "the plan hides what origin/HEAD is: {plan}"
+    );
+}
+
+// Two worktrees on one branch, both merged, go together with their branch
+#[test]
+fn cleanup_handles_two_worktrees_on_one_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let twin = w.wt("twin");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-f",
+            twin.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!twin.exists() && !w.wt("feat-merged").exists());
+    assert!(!has_branch(p, "feat-merged"));
+}
+
+// A cow.base reached through a symlink is still the extra checkout, never a worktree to remove
+#[test]
+fn cleanup_knows_the_extra_checkout_behind_a_symlink() {
+    let w = sweep_setup();
+    if !supported(w.scratch.path()) {
+        return;
+    }
+    let p = w.project.path();
+    let real = w.scratch.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, w.scratch.path().join("link")).unwrap();
+    let base = w.scratch.path().join("link/tpl");
+    sh(p, &["config", "cow.base", base.to_str().unwrap()]);
+    ok(&cow(
+        p,
+        &["add", "-b", "via-link", w.wt("via-link").to_str().unwrap()],
+    ));
+    assert!(real.join("tpl/.git").is_file());
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        real.join("tpl/.git").is_file(),
+        "cleanup removed the extra checkout"
+    );
+}
+
+// tree only reads: no objects, no index writes
+#[test]
+fn tree_writes_nothing() {
+    let w = sweep_setup();
+    let objects = |d: &Path| {
+        let out = Command::new("git")
+            .args(["count-objects", "-v"])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = objects(w.project.path());
+    ok(&cow(
+        w.scratch.path(),
+        &["tree", w.project.path().to_str().unwrap()],
+    ));
+    ok(&cow(w.project.path(), &["cleanup", "-n"]));
+    assert_eq!(
+        objects(w.project.path()),
+        before,
+        "tree or a dry run wrote objects"
+    );
+}
+
+// Cleanup deletes local branches only: the remote keeps every branch, and its tracking refs stay
+#[test]
+fn cleanup_never_deletes_a_remote_branch() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    for b in [
+        "feat-merged",
+        "feat-squashed",
+        "only-merged",
+        "only-squashed",
+    ] {
+        sh(p, &["push", "-q", "origin", b]);
+    }
+    let remote_heads = |dir: &Path| {
+        let out = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = remote_heads(w.remote.path());
+    let tracking = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/remotes/"])
+        .current_dir(p)
+        .output()
+        .unwrap()
+        .stdout;
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!has_branch(p, "only-merged"), "the local branch stayed");
+    assert_eq!(
+        remote_heads(w.remote.path()),
+        before,
+        "a branch was deleted on the remote"
+    );
+    let after = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/remotes/"])
+        .current_dir(p)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(after, tracking, "a remote tracking ref changed");
+}
+
+// tree reads only commits and refs, so a clean filter from a repository's own config never runs
+#[test]
+fn tree_never_runs_a_repository_filter() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("filter-ran");
+    sh(
+        p,
+        &[
+            "config",
+            "filter.spy.clean",
+            &format!("touch {} && cat", marker.display()),
+        ],
+    );
+    let wt = w.wt("feat-active");
+    std::fs::write(wt.join(".gitattributes"), "*.txt filter=spy\n").unwrap();
+    std::fs::write(wt.join("feat-active.txt"), "changed\n").unwrap();
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    assert!(!marker.exists(), "tree ran the repository's clean filter");
+}
+
+fn spy(dir: &Path, marker: &Path) -> PathBuf {
+    let script = dir.join("spy.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+// Edits git status hides, through assume-unchanged or skip-worktree, still count as changes
+#[test]
+fn cleanup_keeps_edits_hidden_from_status() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    sh(
+        &m,
+        &["update-index", "--assume-unchanged", "feat-merged.txt"],
+    );
+    std::fs::write(m.join("feat-merged.txt"), "hidden edit\n").unwrap();
+    let s = w.wt("feat-squashed");
+    sh(
+        &s,
+        &["update-index", "--skip-worktree", "feat-squashed.txt"],
+    );
+    std::fs::write(s.join("feat-squashed.txt"), "hidden edit\n").unwrap();
+    ok(&cow(w.project.path(), &["cleanup", "--yes"]));
+    assert_eq!(
+        std::fs::read_to_string(m.join("feat-merged.txt")).unwrap(),
+        "hidden edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.join("feat-squashed.txt")).unwrap(),
+        "hidden edit\n"
+    );
+}
+
+// A patch id ignores where a change sits, and a squash can be reverted: the files must match too
+#[test]
+fn cleanup_needs_the_branch_files_in_the_base() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    let block = "c1\nc2\nc3\nk\nc4\nc5\nc6\n";
+    let filler = "f1\nf2\nf3\nf4\nf5\nf6\nf7\nf8\nf9\nf10\n";
+    std::fs::write(p.join("b.txt"), format!("{block}{filler}{block}")).unwrap();
+    sh(p, &["add", "b.txt"]);
+    sh(p, &["commit", "-q", "-m", "blocks"]);
+    sh(p, &["checkout", "-q", "-b", "blk"]);
+    let upper = block.replace("\nk\n", "\nK\n");
+    std::fs::write(p.join("b.txt"), format!("{upper}{filler}{block}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "first block"]);
+    sh(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("b.txt"), format!("{block}{filler}{upper}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "second block"]);
+    sh(p, &["checkout", "-q", "-b", "rv"]);
+    commit_on(p, "rv.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "rv"]);
+    sh(p, &["commit", "-q", "-m", "squash rv"]);
+    sh(p, &["revert", "--no-edit", "HEAD"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "blk"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "rv"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// A commit signature check and a lazy fetch both run programs from the repository's config
+#[test]
+fn tree_never_verifies_signatures_or_fetches() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("gpg-ran");
+    let script = spy(w.scratch.path(), &marker);
+    let tree = rev(p, "HEAD^{tree}");
+    let parent = rev(p, "HEAD");
+    let body = format!(
+        "tree {tree}\nparent {parent}\nauthor T <t@t.com> 1700000000 +0000\ncommitter T <t@t.com> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEz\n -----END PGP SIGNATURE-----\n\nsigned\n"
+    );
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .current_dir(p)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), body.as_bytes()).unwrap();
+    let signed = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    sh(p, &["update-ref", "refs/heads/main", signed.trim()]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    sh(p, &["config", "log.showSignature", "true"]);
+    sh(p, &["config", "gpg.program", script.to_str().unwrap()]);
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    ok(&cow(p, &["cleanup", "-n"]));
+    assert!(!marker.exists(), "a signature check ran gpg.program");
+
+    // a partial clone, where reading a branch's blobs would fetch them
+    sh(
+        w.remote.path(),
+        &["config", "uploadpack.allowFilter", "true"],
+    );
+    sh(
+        w.remote.path(),
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    sh(p, &["push", "-q", "origin", "feat-active"]);
+    let part = w.scratch.path().join("part");
+    let url = format!("file://{}", w.remote.path().display());
+    sh(
+        w.scratch.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &url,
+            part.to_str().unwrap(),
+        ],
+    );
+    sh(&part, &["branch", "feat-active", "origin/feat-active"]);
+    sh(
+        &part,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            w.scratch.path().join("pw").to_str().unwrap(),
+            "feat-active",
+        ],
+    );
+    let objects = |d: &Path| {
+        let out = Command::new("git")
+            .args(["count-objects", "-v"])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = objects(&part);
+    ok(&cow(w.scratch.path(), &["tree", part.to_str().unwrap()]));
+    ok(&cow(&part, &["cleanup", "-n"]));
+    assert_eq!(objects(&part), before, "a lazy fetch wrote objects");
+}
+
+// Worktrees whose removal loses what git keeps nowhere else stay, even with --force
+#[test]
+fn cleanup_keeps_worktrees_holding_their_own_state() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let sub = w.scratch.path().join("subrepo");
+    std::fs::create_dir(&sub).unwrap();
+    sh(&sub, &["init", "-q", "-b", "main"]);
+    sh(
+        &sub,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "s",
+        ],
+    );
+    let m = w.wt("feat-merged");
+    sh(
+        &m,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    let s = w.wt("feat-squashed");
+    sh(&s, &["update-ref", "refs/worktree/wip", "HEAD"]);
+    let det = w.wt("det");
+    let gitdir = PathBuf::from(rev(&det, "--absolute-git-dir"));
+    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
+    ok(&cow(p, &["cleanup", "--yes", "--force"]));
+    assert!(
+        m.join("sub").exists(),
+        "a worktree with a submodule was removed"
+    );
+    assert!(s.exists(), "a worktree with its own refs was removed");
+    assert!(det.exists(), "a worktree in a rebase was removed");
+}
+
+#[test]
+fn cleanup_keeps_a_worktree_whose_folder_is_missing() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    std::fs::rename(w.wt("feat-merged"), w.scratch.path().join("unmounted")).unwrap();
+    let plan = ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        planned(&plan, "feat-merged").map(|(v, _)| v),
+        Some("keep (folder missing)".into()),
+        "{plan}"
+    );
+    assert!(has_branch(p, "feat-merged"));
+}
+
+// A remote with a slash in its name, a branch named like a tag, and a branch a rebase holds
+#[test]
+fn cleanup_protects_branches_by_their_full_names() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    sh(
+        p,
+        &[
+            "remote",
+            "add",
+            "up/stream",
+            w.remote.path().to_str().unwrap(),
+        ],
+    );
+    sh(p, &["fetch", "-q", "up/stream"]);
+    sh(p, &["checkout", "-q", "-b", "elsewhere"]);
+    let plan = ok(&cow(p, &["cleanup", "-n", "up/stream/main"]));
+    assert!(
+        planned(&plan, "main").is_none(),
+        "planned the base branch: {plan}"
+    );
+    sh(p, &["checkout", "-q", "main"]);
+
+    sh(p, &["tag", "tg", "feat-merged"]);
+    let tg = w.wt("tg");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "tg",
+            tg.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    sh(p, &["config", "branch.only-merged.remote", "origin"]);
+    let held = w.wt("feat-dirty");
+    let gitdir = PathBuf::from(rev(&held, "--absolute-git-dir"));
+    std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
+    std::fs::write(
+        gitdir.join("rebase-merge/head-name"),
+        "refs/heads/only-squashed\n",
+    )
+    .unwrap();
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        !tg.exists(),
+        "a worktree on a branch named like a tag was not removed"
+    );
+    assert!(
+        has_branch(p, "only-squashed"),
+        "deleted a branch a rebase is working on"
+    );
+    let cfg = Command::new("git")
+        .args(["config", "branch.only-merged.remote"])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    assert!(cfg.stdout.is_empty(), "the deleted branch kept its config");
+}
+
+// Claude Code removes its own worktrees, and a session may still run in one
+#[test]
+fn cleanup_leaves_claude_code_worktrees() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let cc = p.join(".claude/worktrees/cc");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cc",
+            cc.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(cc.exists() && has_branch(p, "cc"));
+}
+
+#[test]
+fn tree_lists_bare_repositories() {
+    let (remote, _project, scratch) = setup();
+    let s = scratch.path();
+    sh(
+        s,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remote.path().to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    sh(
+        &s.join("bare.git"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            s.join("main").to_str().unwrap(),
+            "main",
+        ],
+    );
+    let text = ok(&cow(s, &["tree", s.to_str().unwrap()]));
+    assert!(text.contains("bare.git"), "{text}");
+    assert!(text.contains("1 worktree,"), "{text}");
+}
+
+// Repeated lines let an unrelated edit at a shifted place look like the squash of this branch
+#[test]
+fn cleanup_keeps_an_edit_the_base_made_elsewhere_in_repeated_lines() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    let mut text = String::new();
+    for i in 1..=9 {
+        text.push('u');
+        text.push_str(&i.to_string());
+        text.push('\n');
+    }
+    for _ in 0..21 {
+        text.push_str("k\n");
+    }
+    std::fs::write(p.join("f.txt"), &text).unwrap();
+    sh(p, &["add", "f.txt"]);
+    sh(p, &["commit", "-q", "-m", "f"]);
+    let edit = |line: usize| {
+        let body = std::fs::read_to_string(p.join("f.txt")).unwrap();
+        let mut lines: Vec<String> = body.lines().map(String::from).collect();
+        lines[line - 1] = "Y".into();
+        let mut joined = lines.join("\n");
+        joined.push('\n');
+        std::fs::write(p.join("f.txt"), joined).unwrap();
+    };
+    sh(p, &["checkout", "-q", "-b", "b"]);
+    edit(20);
+    sh(p, &["commit", "-q", "-am", "b"]);
+    sh(p, &["checkout", "-q", "main"]);
+    let body = std::fs::read_to_string(p.join("f.txt")).unwrap();
+    std::fs::write(p.join("f.txt"), format!("t1\nt2\n{body}")).unwrap();
+    sh(p, &["commit", "-q", "-am", "top"]);
+    edit(20);
+    sh(p, &["commit", "-q", "-am", "unrelated"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "b"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// A squash the base undid, by a git revert after a nearby edit or by a commit with the reverse
+// patch, is not landed. An undo hidden in a merge goes unseen, the work stays in the squash commit
+#[test]
+fn cleanup_keeps_a_squash_the_base_undid() {
+    let (_r, project, _s) = setup();
+    let p = project.path();
+    std::fs::write(p.join("g.txt"), "1\n2\n3\n4\n5\n6\n").unwrap();
+    sh(p, &["add", "g.txt"]);
+    sh(p, &["commit", "-q", "-m", "g"]);
+    sh(p, &["checkout", "-q", "-b", "near"]);
+    std::fs::write(p.join("g.txt"), "1\n2\nX\n4\n5\n6\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "near"]);
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "near"]);
+    sh(p, &["commit", "-q", "-m", "squash near"]);
+    let squash = rev(p, "HEAD");
+    std::fs::write(p.join("g.txt"), "1\n2\nX\n4\nZ\n6\n").unwrap();
+    sh(p, &["commit", "-q", "-am", "edit nearby"]);
+    sh(p, &["revert", "--no-edit", &squash]);
+
+    sh(p, &["checkout", "-q", "-b", "undone", "main"]);
+    commit_on(p, "m.txt");
+    sh(p, &["checkout", "-q", "main"]);
+    sh(p, &["merge", "-q", "--squash", "undone"]);
+    sh(p, &["commit", "-q", "-m", "squash undone"]);
+    sh(p, &["rm", "-q", "m.txt"]);
+    sh(p, &["commit", "-q", "-m", "drop m again"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    let plan = ok(&cow(p, &["cleanup", "-n"]));
+    assert_eq!(
+        planned(&plan, "near"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+    assert_eq!(
+        planned(&plan, "undone"),
+        Some(("keep".into(), "active".into())),
+        "{plan}"
+    );
+}
+
+// An ignored folder holding its own repository is work git status never shows
+#[test]
+fn cleanup_keeps_a_worktree_with_an_ignored_repository() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    std::fs::create_dir(m.join("out")).unwrap();
+    sh(&m.join("out"), &["init", "-q"]);
+    sh(
+        &m.join("out"),
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "mine",
+        ],
+    );
+    ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert!(
+        m.join("out/.git").is_dir(),
+        "an ignored nested repository was removed"
+    );
+}
+
+// update-ref -d through a symbolic ref deletes the branch it points to
+#[test]
+fn cleanup_skips_a_branch_that_is_a_symbolic_ref() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let main = rev(p, "refs/heads/main");
+    sh(p, &["symbolic-ref", "refs/heads/trunk", "refs/heads/main"]);
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert_eq!(
+        rev(p, "refs/heads/main"),
+        main,
+        "main was deleted through an alias"
+    );
+}
+
+// With its folder gone, a worktree's own refs live only in its admin folder
+#[test]
+fn cleanup_force_keeps_the_refs_of_a_missing_worktree() {
+    let w = sweep_setup();
+    let m = w.wt("feat-merged");
+    sh(&m, &["update-ref", "refs/worktree/save", "HEAD"]);
+    std::fs::rename(&m, w.scratch.path().join("unmounted")).unwrap();
+    let plan = ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert_eq!(
+        planned(&plan, "feat-merged").map(|(v, _)| v),
+        Some("keep (has its own refs)".into()),
+        "{plan}"
+    );
+}
+
+// --force says which worktrees lose changes, and a path with a newline is read whole
+#[test]
+fn cleanup_marks_discarded_changes_and_reads_any_path() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let plan = ok(&cow(p, &["cleanup", "-n", "--force"]));
+    assert_eq!(
+        planned(&plan, "feat-dirty").map(|(v, _)| v),
+        Some("remove (discards changes)".into()),
+        "{plan}"
+    );
+    let odd = w.scratch.path().join("odd\nname");
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "odd",
+            odd.to_str().unwrap(),
+            "feat-merged",
+        ],
+    );
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(
+        !odd.exists(),
+        "the worktree with a newline in its path stayed"
+    );
+    assert!(w.wt("feat-active").exists());
+}
+
+// Ignored folders are walked all the way down for a repository of its own
+#[test]
+fn cleanup_keeps_a_repository_deep_in_an_ignored_folder() {
+    let w = sweep_setup();
+    let deep = w.wt("feat-merged").join("out/a/b/c/d/repo");
+    std::fs::create_dir_all(&deep).unwrap();
+    sh(&deep, &["init", "-q"]);
+    sh(
+        &deep,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "mine",
+        ],
+    );
+    ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert!(
+        deep.join(".git").is_dir(),
+        "a deep nested repository was removed"
+    );
+}
+
+// Every commit cleanup lets go of stays reachable from refs/git-cow/deleted, so gc never prunes it
+#[test]
+fn cleanup_backs_up_what_it_deletes() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let det = w.wt("det");
+    commit_on(&det, "experiment.txt");
+    let lost = rev(&det, "HEAD");
+    sh(&det, &["checkout", "-q", "--detach", "origin/main"]);
+    let only = rev(p, "refs/heads/only-merged");
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!det.exists(), "the detached worktree stayed");
+    let backups = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/git-cow/deleted/",
+        ])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    let backups = String::from_utf8_lossy(&backups.stdout);
+    assert!(
+        backups.contains(&lost),
+        "a commit only the reflog held was lost: {backups}"
+    );
+    assert!(
+        backups.contains(&only),
+        "a deleted branch has no backup: {backups}"
+    );
+}
+
+// A merge driver from info/attributes, core.attributesFile or merge.default never runs
+#[test]
+fn tree_never_runs_a_merge_driver() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("driver-ran");
+    let script = spy(w.scratch.path(), &marker);
+    // a squash whose replay must merge file content, in a worktree so tree judges it too
+    let lines = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+    std::fs::write(p.join("long.txt"), lines).unwrap();
+    sh(p, &["add", "long.txt"]);
+    sh(p, &["commit", "-q", "-m", "long"]);
+    sh(p, &["checkout", "-q", "-b", "mix", "main"]);
+    std::fs::write(p.join("long.txt"), lines.replace("11\n", "mix\n")).unwrap();
+    sh(p, &["commit", "-q", "-am", "mix"]);
+    sh(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("long.txt"), lines.replace("1\n2\n", "top\n2\n")).unwrap();
+    sh(p, &["commit", "-q", "-am", "top"]);
+    sh(p, &["merge", "-q", "--squash", "mix"]);
+    sh(p, &["commit", "-q", "-m", "squash mix"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            w.wt("mix").to_str().unwrap(),
+            "mix",
+        ],
+    );
+    let driver = format!("{} %O %A %B", script.display());
+    sh(p, &["config", "merge.spy.driver", &driver]);
+    sh(p, &["config", "merge.default", "spy"]);
+    let attrs = w.scratch.path().join("attrs");
+    std::fs::write(&attrs, "* merge=spy\n").unwrap();
+    sh(
+        p,
+        &["config", "core.attributesFile", attrs.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(p.join(".git/info")).unwrap();
+    std::fs::write(p.join(".git/info/attributes"), "* merge=spy\n").unwrap();
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    ok(&cow(p, &["cleanup", "-n"]));
+    assert!(!marker.exists(), "a merge driver ran");
 }

@@ -3104,3 +3104,113 @@ fn cleanup_marks_discarded_changes_and_reads_any_path() {
     );
     assert!(w.wt("feat-active").exists());
 }
+
+// Ignored folders are walked all the way down for a repository of its own
+#[test]
+fn cleanup_keeps_a_repository_deep_in_an_ignored_folder() {
+    let w = sweep_setup();
+    let deep = w.wt("feat-merged").join("out/a/b/c/d/repo");
+    std::fs::create_dir_all(&deep).unwrap();
+    sh(&deep, &["init", "-q"]);
+    sh(
+        &deep,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=T",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "mine",
+        ],
+    );
+    ok(&cow(w.project.path(), &["cleanup", "--yes", "--force"]));
+    assert!(
+        deep.join(".git").is_dir(),
+        "a deep nested repository was removed"
+    );
+}
+
+// Every commit cleanup lets go of stays reachable from refs/git-cow/deleted, so gc never prunes it
+#[test]
+fn cleanup_backs_up_what_it_deletes() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let det = w.wt("det");
+    commit_on(&det, "experiment.txt");
+    let lost = rev(&det, "HEAD");
+    sh(&det, &["checkout", "-q", "--detach", "origin/main"]);
+    let only = rev(p, "refs/heads/only-merged");
+    ok(&cow(p, &["cleanup", "--yes"]));
+    assert!(!det.exists(), "the detached worktree stayed");
+    let backups = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/git-cow/deleted/",
+        ])
+        .current_dir(p)
+        .output()
+        .unwrap();
+    let backups = String::from_utf8_lossy(&backups.stdout);
+    assert!(
+        backups.contains(&lost),
+        "a commit only the reflog held was lost: {backups}"
+    );
+    assert!(
+        backups.contains(&only),
+        "a deleted branch has no backup: {backups}"
+    );
+}
+
+// A merge driver from info/attributes, core.attributesFile or merge.default never runs
+#[test]
+fn tree_never_runs_a_merge_driver() {
+    let w = sweep_setup();
+    let p = w.project.path();
+    let marker = w.scratch.path().join("driver-ran");
+    let script = spy(w.scratch.path(), &marker);
+    // a squash whose replay must merge file content, in a worktree so tree judges it too
+    let lines = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+    std::fs::write(p.join("long.txt"), lines).unwrap();
+    sh(p, &["add", "long.txt"]);
+    sh(p, &["commit", "-q", "-m", "long"]);
+    sh(p, &["checkout", "-q", "-b", "mix", "main"]);
+    std::fs::write(p.join("long.txt"), lines.replace("11\n", "mix\n")).unwrap();
+    sh(p, &["commit", "-q", "-am", "mix"]);
+    sh(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("long.txt"), lines.replace("1\n2\n", "top\n2\n")).unwrap();
+    sh(p, &["commit", "-q", "-am", "top"]);
+    sh(p, &["merge", "-q", "--squash", "mix"]);
+    sh(p, &["commit", "-q", "-m", "squash mix"]);
+    sh(p, &["push", "-q", "origin", "main"]);
+    sh(p, &["fetch", "-q", "origin"]);
+    sh(
+        p,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            w.wt("mix").to_str().unwrap(),
+            "mix",
+        ],
+    );
+    let driver = format!("{} %O %A %B", script.display());
+    sh(p, &["config", "merge.spy.driver", &driver]);
+    sh(p, &["config", "merge.default", "spy"]);
+    let attrs = w.scratch.path().join("attrs");
+    std::fs::write(&attrs, "* merge=spy\n").unwrap();
+    sh(
+        p,
+        &["config", "core.attributesFile", attrs.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(p.join(".git/info")).unwrap();
+    std::fs::write(p.join(".git/info/attributes"), "* merge=spy\n").unwrap();
+    ok(&cow(w.scratch.path(), &["tree", p.to_str().unwrap()]));
+    ok(&cow(p, &["cleanup", "-n"]));
+    assert!(!marker.exists(), "a merge driver ran");
+}

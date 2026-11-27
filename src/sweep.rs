@@ -10,11 +10,11 @@ use crate::other;
 
 // One tab separated line: what happens, how far the work landed, the branch, the worktree path
 fn line(item: &Item) -> String {
-    let verb = match (&item.action, &item.path) {
+    let verb = match (item.action(), item.path()) {
         (Action::Remove, Some(_)) if item.discards_changes() => {
             "remove (discards changes)".to_string()
         }
-        (Action::Remove, Some(_)) if item.deletes_branch() || item.branch.is_none() => {
+        (Action::Remove, Some(_)) if item.deletes_branch() || item.branch().is_none() => {
             "remove".to_string()
         }
         (Action::Remove, Some(_)) => "remove (keeps branch)".to_string(),
@@ -23,12 +23,11 @@ fn line(item: &Item) -> String {
         (Action::Keep(why), _) => format!("keep ({why})"),
         _ => "keep".to_string(),
     };
-    let branch = item.branch.as_deref().unwrap_or("(detached)");
+    let branch = item.branch().unwrap_or("(detached)");
     let path = item
-        .path
-        .as_ref()
+        .path()
         .map_or_else(String::new, |p| p.display().to_string());
-    format!("{verb}\t{}\t{branch}\t{path}", item.state.label())
+    format!("{verb}\t{}\t{branch}\t{path}", item.state().label())
         .trim_end()
         .to_string()
 }
@@ -87,20 +86,20 @@ pub(crate) fn cleanup(args: &[String]) -> io::Result<()> {
     }
     warn_without_squash_check();
     let plan = cleanup::plan(&std::env::current_dir()?, &opts)?;
-    for item in &plan.items {
+    for item in plan.items() {
         println!("{}", line(item));
     }
     let removals: Vec<&Item> = plan
-        .items
+        .items()
         .iter()
-        .filter(|i| matches!(i.action, Action::Remove))
+        .filter(|i| matches!(i.action(), Action::Remove))
         .collect();
-    let against = format!("against {} ({})", plan.base.name, short(&plan.base.oid));
+    let against = format!("against {} ({})", plan.base().name, short(&plan.base().oid));
     if removals.is_empty() {
         println!("nothing to clean up {against}");
         return Ok(());
     }
-    let worktrees = removals.iter().filter(|i| i.path.is_some()).count();
+    let worktrees = removals.iter().filter(|i| i.path().is_some()).count();
     let branches = removals.iter().filter(|i| i.deletes_branch()).count();
     let wt_noun = if worktrees == 1 {
         "worktree"

@@ -95,7 +95,7 @@ use git_cow::cleanup::{self, Action, Done, Options};
 
 // a worktree this tool made, once its pull request merged
 let plan = cleanup::plan_worktree(repo, worktree, &Options::default())?;
-if matches!(plan.items[0].action, Action::Remove) {
+if matches!(plan.items()[0].action(), Action::Remove) {
     for done in cleanup::execute(&plan) {
         if let Done::Deleted { branch, backup, .. } = done {
             println!("deleted {branch}, kept as {backup}");
@@ -104,7 +104,7 @@ if matches!(plan.items[0].action, Action::Remove) {
 }
 ```
 
-`cleanup::plan(repo, &opts)` judges every worktree and local branch, and changes nothing. `cleanup::execute(&plan)` removes what the plan marks, with the same checks and backup refs as the CLI, and returns what it did. `cleanup::survey(repo)` gives each worktree's state without reading its files, as `git cow tree` does. `Options` names the base branch and whether to remove landed worktrees with changes.
+`cleanup::plan(repo, &opts)` judges every worktree and local branch, and changes nothing. `cleanup::execute(&plan)` removes what the plan marks, with the same checks and backup refs as the CLI, and returns what it did. `cleanup::survey(repo)` gives each worktree's state without reading its files, as `git cow tree` does. `Options` names the base branch and whether to remove landed worktrees with changes or a missing folder. A plan's items can be read but not changed, so `execute` only ever removes what the plan judged safe.
 
 The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 

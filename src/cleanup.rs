@@ -696,11 +696,12 @@ pub enum Keep {
     NotLanded,
     /// `git worktree lock` holds it
     Locked,
-    /// The plan was made from inside it
+    /// The `dir` the plan was made from is inside it
     Inside,
     /// Claude Code removes its own worktrees, and a session may still run in one
     ClaudeCode,
-    /// It is on the base branch or the main checkout's branch
+    /// It is on the base branch, the default branch, the main checkout's branch, or a branch a
+    /// rebase or bisect works on
     BaseBranch,
     /// Its folder is gone, kept unless [`Options::force`]
     FolderMissing,
@@ -753,17 +754,23 @@ pub struct Options {
     pub force: bool,
 }
 
-/// One worktree, or a local branch with no worktree, and what the plan does with it
+/**
+ * One worktree, or a local branch with no worktree, and what the plan does with it. Only [`plan`]
+ * and [`plan_worktree`] make one, and a caller can read but never change it, so [`execute`] only
+ * ever removes what the plan judged safe:
+ *
+ * ```compile_fail
+ * # use git_cow::cleanup::{self, Action, Options};
+ * # let plan = cleanup::plan(std::path::Path::new("."), &Options::default()).unwrap();
+ * plan.items()[0].action = Action::Remove;
+ * ```
+ **/
 #[derive(Debug)]
 pub struct Item {
-    /// The worktree, or None for a branch with no worktree
-    pub path: Option<PathBuf>,
-    /// Its branch, or None for a detached worktree
-    pub branch: Option<String>,
-    /// How far its work landed
-    pub state: State,
-    /// What [`execute`] does with it
-    pub action: Action,
+    path: Option<PathBuf>,
+    branch: Option<String>,
+    state: State,
+    action: Action,
     // the commit and the changes the plan judged, so the run skips anything that moved since
     oid: String,
     changes: String,
@@ -775,6 +782,26 @@ pub struct Item {
 }
 
 impl Item {
+    /// The worktree, or None for a branch with no worktree
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Its branch, or None for a detached worktree
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// How far its work landed
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// What [`execute`] does with it
+    pub fn action(&self) -> Action {
+        self.action
+    }
+
     /// The commit the plan judged
     pub fn oid(&self) -> &str {
         &self.oid
@@ -795,12 +822,26 @@ impl Item {
 /// Every worktree and local branch [`plan`] judged
 #[derive(Debug)]
 pub struct Plan {
+    repo: PathBuf,
+    base: Base,
+    items: Vec<Item>,
+}
+
+impl Plan {
     /// The main worktree or bare repository every git call runs in
-    pub repo: PathBuf,
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
     /// What the plan compared with
-    pub base: Base,
+    pub fn base(&self) -> &Base {
+        &self.base
+    }
+
     /// One per worktree, then one per local branch with no worktree
-    pub items: Vec<Item>,
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
 }
 
 fn worktree_items(
@@ -944,6 +985,11 @@ fn judge(dir: &Path, opts: &Options, only: Option<&Path>) -> io::Result<Plan> {
         linked.retain(|w| w.path == path || (branch.is_some() && w.branch == branch));
         let mut items = worktree_items(&repo, &base, &linked, &protected, &here, force);
         items.retain(|i| i.path.as_ref() == Some(&path));
+        if linked.len() > 1 {
+            for item in &mut items {
+                item.branch_too = false;
+            }
+        }
         return Ok(Plan { repo, base, items });
     }
     let mut items = worktree_items(&repo, &base, &linked, &protected, &here, force);
@@ -1059,7 +1105,8 @@ fn back_up_reflog(repo: &Path, admin: &Path, name: &str, stamp: &str) -> io::Res
     let lost = unreachable.lines().filter(|o| oids.contains(o));
     for (i, oid) in lost.enumerate() {
         let backup = format!("{BACKUP}/{stamp}/worktree/{}/{i}", ref_part(name));
-        run(repo, &["update-ref", &backup, oid])?;
+        // an empty old value makes update-ref refuse a ref that exists
+        run(repo, &["update-ref", &backup, oid, ""])?;
     }
     Ok(())
 }
@@ -1078,7 +1125,7 @@ fn delete_branch(repo: &Path, b: &str, oid: &str, stamp: &str) -> io::Result<Str
         return Err(err(format!("a rebase or bisect works on {b}")));
     }
     let backup = format!("{BACKUP}/{stamp}/branch/{b}");
-    run(repo, &["update-ref", &backup, oid])?;
+    run(repo, &["update-ref", &backup, oid, ""])?;
     run(
         repo,
         &[
@@ -1123,20 +1170,23 @@ pub enum Done {
 
 /**
  * Remove every worktree and delete every branch the plan marks [`Action::Remove`]. Each commit
- * it lets go of is saved under `refs/git-cow/deleted/<time>/` first, and an item that moved since
+ * it lets go of is saved under `refs/git-cow/deleted/<seconds>-<pid>-<call>/` first, and an item that moved since
  * the plan stays
  **/
 pub fn execute(plan: &Plan) -> Vec<Done> {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
     let repo = &plan.repo;
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let stamp = format!("{secs}-{}", std::process::id());
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let stamp = format!("{secs}-{}-{call}", std::process::id());
     let mut done = Vec::new();
-    for item in plan
+    for (n, item) in plan
         .items
         .iter()
         .filter(|i| matches!(i.action, Action::Remove))
+        .enumerate()
     {
         if let Some(path) = &item.path {
             let p = path.to_string_lossy().into_owned();
@@ -1148,7 +1198,8 @@ pub fn execute(plan: &Plan) -> Vec<Done> {
                 done.push(failed("it changed since the plan".into()));
                 continue;
             }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let leaf = path.file_name().unwrap_or_default().to_string_lossy();
+            let name = format!("{n}-{leaf}");
             if let Some(admin) = &item.admin
                 && let Err(e) = back_up_reflog(repo, admin, &name, &stamp)
             {
@@ -1174,7 +1225,7 @@ pub fn execute(plan: &Plan) -> Vec<Done> {
                     backup,
                 },
                 Err(e) => Done::Failed {
-                    what: b.clone(),
+                    what: format!("branch {b}"),
                     why: e.to_string(),
                 },
             });
@@ -1186,7 +1237,7 @@ pub fn execute(plan: &Plan) -> Vec<Done> {
 /// Whether this git can tell a squash merge: it needs `patch-id --verbatim` and `--attr-source`,
 /// both in git 2.40. Without them squash-merged branches show as active and stay
 pub fn squash_check_works() -> bool {
-    git_cmd(Path::new("."))
+    git_cmd(&std::env::temp_dir())
         .args([NO_ATTRIBUTES, "patch-id", "--verbatim"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -367,8 +367,22 @@ mod tests {
 
         fs::create_dir(&target)?;
         fs::write(target.join("keep"), b"outside the cloned tree")?;
+        remove_any(&cloned);
+        assert_eq!(
+            cloned
+                .symlink_metadata()
+                .expect_err("junction is gone")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(target.join("keep"))?, b"outside the cloned tree");
+
+        clone_into(&src, &dst)?;
         remove_any(&dst);
-        assert!(!dst.exists(), "cleanup must remove the cloned junction");
+        assert!(
+            !dst.exists(),
+            "cleanup must remove the tree with its junction"
+        );
         assert_eq!(fs::read(target.join("keep"))?, b"outside the cloned tree");
         temp.close()
     }
@@ -411,7 +425,15 @@ mod tests {
                 reparse_tag(&read_reparse_data(&cloned)?),
                 IO_REPARSE_TAG_SYMLINK
             );
-            assert_eq!(fs::read_link(cloned)?, target);
+            assert_eq!(fs::read_link(&cloned)?, target);
+            remove_any(&cloned);
+            assert_eq!(
+                cloned
+                    .symlink_metadata()
+                    .expect_err("dangling link is gone")
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
         }
         temp.close()
     }

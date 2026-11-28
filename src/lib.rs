@@ -269,7 +269,15 @@ fn real(dir: &Path, args: &[&str]) -> Option<PathBuf> {
 }
 
 fn remove_any(path: &Path) {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileTypeExt;
+
     match fs::symlink_metadata(path) {
+        // Windows directory symlinks and junctions are links, not ordinary directories.
+        #[cfg(windows)]
+        Ok(m) if m.file_type().is_symlink_dir() => {
+            let _ = fs::remove_dir(path);
+        }
         Ok(m) if m.is_dir() => {
             let _ = fs::remove_dir_all(path);
         }

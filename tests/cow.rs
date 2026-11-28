@@ -715,32 +715,55 @@ fn add_failing_after_git_registered_the_worktree_leaves_nothing() {
     sh(p, &["commit", "-q", "-m", "clash"]);
     sh(p, &["checkout", "-q", "--detach", "origin/main"]);
 
+    let tpl = scratch.path().join(".git-cow/p");
     let wt = scratch.path().join("t1");
-    let res = git_cow::add(
-        p,
-        &scratch.path().join(".git-cow/p"),
-        "origin/main",
-        &wt,
-        Some("t1"),
-        Some("clash"),
-    );
-    assert!(res.is_err(), "the clash must fail populate");
-    assert!(!wt.exists());
-    let out = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(p)
-        .output()
-        .unwrap();
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("/t1\n"),
-        "a failed add left its registration"
-    );
-    let out = Command::new("git")
-        .args(["branch", "--list", "t1"])
-        .current_dir(p)
-        .output()
-        .unwrap();
-    assert!(out.stdout.is_empty(), "a failed add left its branch");
+    for existing in [false, true] {
+        if existing {
+            std::fs::create_dir(&wt).unwrap();
+            // The first attempt created the template. Exercise rollback with read-only clones too.
+            #[cfg(windows)]
+            {
+                let file = tpl.join("a.txt");
+                let mut permissions = file.metadata().unwrap().permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(file, permissions).unwrap();
+            }
+        }
+        let res = git_cow::add(p, &tpl, "origin/main", &wt, Some("t1"), Some("clash"));
+        assert!(res.is_err(), "the clash must fail populate");
+        if existing {
+            assert_eq!(std::fs::read_dir(&wt).unwrap().count(), 0);
+            #[cfg(windows)]
+            assert!(
+                tpl.join("a.txt")
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+        } else {
+            assert!(!wt.exists());
+        }
+        let out = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            !String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.ends_with("/t1")),
+            "a failed add left its registration"
+        );
+        let out = Command::new("git")
+            .args(["branch", "--list", "t1"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty(), "a failed add left its branch");
+    }
 }
 
 #[test]
@@ -2272,6 +2295,19 @@ fn cleanup_removes_what_landed_and_keeps_the_rest() {
         "a locked worktree stays even with --force"
     );
     assert!(w.wt("feat-active").exists());
+}
+
+#[test]
+fn tree_rejects_missing_and_non_directory_roots() {
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(scratch.path().join("file"), b"not a directory").unwrap();
+    std::fs::create_dir(scratch.path().join("empty")).unwrap();
+    for invalid in ["missing", "file"] {
+        let out = cow(scratch.path(), &["tree", invalid]);
+        assert!(!out.status.success(), "tree accepted {invalid}");
+        assert!(!out.stderr.is_empty(), "no error for {invalid}");
+    }
+    assert_eq!(ok(&cow(scratch.path(), &["tree", "empty"])), "");
 }
 
 #[test]

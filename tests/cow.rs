@@ -116,10 +116,30 @@ fn branch_differing_from_template_gets_its_own_files() {
     sh(project.path(), &["commit", "-q", "-m", "task"]);
     sh(project.path(), &["checkout", "-q", "--detach"]);
 
+    let tpl = scratch.path().join(".git-cow/p");
+    #[cfg(windows)]
+    {
+        git_cow::add(
+            project.path(),
+            &tpl,
+            "origin/main",
+            &scratch.path().join("seed-readonly"),
+            Some("seed-readonly"),
+            Some("origin/main"),
+        )
+        .unwrap();
+        // The target branch both replaces one read-only file and removes another.
+        for name in ["a.txt", "d.txt"] {
+            let path = tpl.join(name);
+            let mut permissions = path.metadata().unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
     let wt = scratch.path().join("task-3");
     git_cow::add(
         project.path(),
-        &scratch.path().join(".git-cow/p"),
+        &tpl,
         "origin/main",
         &wt,
         None,
@@ -133,6 +153,10 @@ fn branch_differing_from_template_gets_its_own_files() {
     assert_eq!(std::fs::read_to_string(wt.join("b.txt")).unwrap(), "b\n");
     assert!(!wt.join("d.txt").exists());
     assert!(clean(&wt));
+    #[cfg(windows)]
+    for name in ["a.txt", "d.txt"] {
+        assert!(tpl.join(name).metadata().unwrap().permissions().readonly());
+    }
 }
 
 #[test]

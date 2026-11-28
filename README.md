@@ -70,7 +70,7 @@ git config --global cow.base '~/.orch/state/templates/{repo}'
 
 The extra checkout and the worktrees must be on the same clone-capable volume: APFS on macOS, btrfs or XFS with `reflink=1` on Linux, or ReFS with block cloning on Windows (including ReFS Dev Drives). Put your main checkout on that volume too if you want to share its build output. When the extra checkout cannot be cloned to the worktree (for example, on NTFS, ext4, HFS+, or across volumes), git-cow uses `git worktree add` instead.
 
-On Windows, the default `cow.root` is under your user profile, which is usually on NTFS. If `R:` is your ReFS volume, set `git config cow.root R:/worktrees` or pass a path on `R:` to `git cow add`. No `cp` or WSL is required. The Windows backend preserves file modification times and recreates symlinks without following them (this may require Developer Mode or symlink privileges). It clones file data, not ACLs or alternate data streams.
+On Windows, the default `cow.root` is under your user profile, which is usually on NTFS. If `R:` is your ReFS volume, set `git config cow.root R:/worktrees` or pass a path on `R:` to `git cow add`. No `cp` or WSL is required. The Windows backend preserves modification times, basic DOS attributes (read-only, hidden, system, archive, and not-content-indexed), and ReFS integrity settings on regular files. It recreates junctions and symlinks without following them (creating symlinks may require Developer Mode or symlink privileges). Mounted volumes are not cloned, and ACLs and alternate data streams are not copied.
 
 ## Library
 
@@ -108,7 +108,7 @@ if matches!(plan.items()[0].action(), Action::Remove) {
 
 `cleanup::plan(repo, &opts)` judges every worktree and local branch, and changes nothing. `cleanup::execute(&plan)` removes what the plan marks, with the same checks and backup refs as the CLI, and returns what it did. `cleanup::survey(repo)` gives each worktree's state without reading its files, as `git cow tree` does. `Options` names the base branch and whether to remove landed worktrees with changes or a missing folder. A plan's items can be read but not changed, so `execute` only ever removes what the plan judged safe.
 
-The library is synchronous. Besides Git, it uses native APIs on macOS and Windows (via `windows-sys` on Windows) and GNU `cp` on Linux. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
+The library is synchronous and has no runtime crate dependencies. Besides Git, it uses native APIs on macOS and Windows and GNU `cp` on Linux. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 
 ## Benchmarks
 

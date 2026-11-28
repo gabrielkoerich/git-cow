@@ -1,5 +1,5 @@
 //! Git worktrees cloned from a per-repository template checkout, sharing disk blocks until written.
-//! macOS clones whole directories with clonefile(2), Linux uses `cp --reflink=always` (FICLONE)
+//! macOS uses clonefile(2), Linux uses `cp --reflink=always`, and Windows uses `ReFS` block cloning.
 
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
@@ -13,6 +13,10 @@ use std::process::Command;
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 pub mod cleanup;
+#[cfg(windows)]
+mod refs;
+#[cfg(windows)]
+use refs::clone_into;
 
 /// A path from git config `key` in `repo`, with `~/` and `{repo}` expanded
 pub fn config_path(repo: &Path, key: &str) -> Option<PathBuf> {
@@ -21,9 +25,8 @@ pub fn config_path(repo: &Path, key: &str) -> Option<PathBuf> {
         Ok(name) => v.replace("{repo}", &name),
         Err(_) => v,
     };
-    let home = std::env::var("HOME").unwrap_or_default();
     Some(match v.strip_prefix("~/") {
-        Some(rest) => Path::new(&home).join(rest),
+        Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
         None => PathBuf::from(v),
     })
 }
@@ -156,7 +159,7 @@ fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn clone_into(src: &Path, dst_dir: &Path) -> io::Result<()> {
     // fails instead of copying when the volume cannot clone
     let out = Command::new("cp")
@@ -252,7 +255,11 @@ fn beside(template: &Path, ext: &str) -> PathBuf {
 
 // Held while a template changes, so a clone never sees it half updated, across processes too
 fn lock_template(template: &Path) -> io::Result<File> {
-    let file = File::create(beside(template, "lock"))?;
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(beside(template, "lock"))?;
     file.lock()?;
     Ok(file)
 }
@@ -262,7 +269,15 @@ fn real(dir: &Path, args: &[&str]) -> Option<PathBuf> {
 }
 
 fn remove_any(path: &Path) {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileTypeExt;
+
     match fs::symlink_metadata(path) {
+        // Windows directory symlinks and junctions are links, not ordinary directories.
+        #[cfg(windows)]
+        Ok(m) if m.file_type().is_symlink_dir() => {
+            let _ = fs::remove_dir(path);
+        }
         Ok(m) if m.is_dir() => {
             let _ = fs::remove_dir_all(path);
         }
@@ -427,7 +442,7 @@ fn foreign(template: &Path) -> Option<Foreign> {
         }
     }
     // before the scan, which would walk all of home
-    let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
+    let home = std::env::home_dir().and_then(|h| fs::canonicalize(h).ok());
     if let (Some(home), Ok(real)) = (home, fs::canonicalize(template))
         && home.starts_with(&real)
     {

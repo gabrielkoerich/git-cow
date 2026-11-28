@@ -30,6 +30,7 @@ fn relative_paths_resolve_against_the_current_directory() {
     repo(cwd.path());
     std::fs::write(cwd.path().join("a.txt"), "uncommitted\n").unwrap();
     std::fs::create_dir(cwd.path().join("w")).unwrap();
+    let original = std::env::current_dir().unwrap();
     std::env::set_current_dir(cwd.path()).unwrap();
 
     let res = git_cow::add_or_plain(
@@ -41,6 +42,7 @@ fn relative_paths_resolve_against_the_current_directory() {
         None,
         &git_cow::Options::default(),
     );
+    std::env::set_current_dir(original).unwrap();
     res.expect("add with relative paths");
     assert_eq!(
         std::fs::read_to_string(cwd.path().join("a.txt")).unwrap(),

@@ -2,8 +2,8 @@
 name: git-worktrees
 description: >
   The git-worktrees skill. Create, list, warm, and remove worktrees with the
-  git cow command. It uses copy-on-write, so a new worktree shares files
-  and uses less disk space. A worktree you create goes in ~/.worktrees/<project>/.
+  git cow command. On a supported volume, copy-on-write lets worktrees share
+  files and use less disk space. The default root is ~/.worktrees/.
   A worktree Claude Code already created under <project>/.claude/worktrees
   uses the same commands. Never call the git worktree command yourself.
   Use when the user wants a worktree or runs /git-worktrees.
@@ -15,7 +15,7 @@ Call the `git cow` command only. Run it from a checkout of the repository. Never
 
 ## Install
 
-Do this before any other command. If `git cow` already runs, skip the install.
+Do this before any other command. If `git cow` already runs, skip the install. On Windows, see the PowerShell instructions below for using a ReFS-enabled build.
 
 ```bash
 git cow --help
@@ -42,7 +42,7 @@ git cow --help
 
 If `cargo` is missing, or the install fails, stop and tell the user. Do not create the worktree another way.
 
-If the disk cannot clone files, or the repository has submodules, `git cow` still does the work. You still call `git cow` only. If `git cow add` prints a warning that cloning failed, the worktree is still made. Tell the user the warning.
+If cloning is unavailable, `git cow add` can fall back to an ordinary worktree. If it succeeds and prints `using git worktree add`, report the fallback to the user: the worktree exists but did not share the template's cache. Do not retry with `--force`.
 
 ## Where it goes
 
@@ -66,6 +66,24 @@ esac
 `cow.root` replaces `~/.worktrees` when it is set. Expand a leading `~/`. A value that contains `{repo}` already names the project folder, so append only `/<leaf>`.
 
 Claude Code keeps its own worktrees in the main checkout at `.claude/worktrees/<name>`, on branch `worktree-<name>`. That path is `"$(dirname "$common")/.claude/worktrees/<name>"`. The WorktreeCreate hook runs `git cow add` there. Do not create that directory yourself. When `git cow list` shows one, or your current directory is already inside one, keep that path for every later `git cow` command.
+
+## Windows and ReFS (PowerShell)
+
+Use a `git-cow.exe` with ReFS support. `Get-Command git-cow` shows which binary is on `PATH`. To use a local build, run `cargo build --release --locked` from the git-cow checkout, then prepend its `target\release` directory to `$env:Path` for this session.
+
+The default `cow.root` is under the user profile, often on NTFS. Check the filesystem before choosing a root: for example, `(Get-Volume -DriveLetter R).FileSystem` for drive `R:`. Use a ReFS volume that supports block cloning, such as a ReFS Dev Drive. The template and its worktrees must be on the same volume. Put the main checkout there too if you want to share its build cache. If `cow.base` is set, check it points to the same volume as the worktrees; otherwise the template goes beside the worktree automatically.
+
+Only change `cow.root` with the user's approval, and prefer the repository-local setting. With an approved ReFS root and from the target repository:
+
+```powershell
+# Example: R: is the ReFS volume. Do not assume this drive exists.
+git config --local cow.root R:/worktrees
+git cow list
+# To create a new feat/login branch:
+git cow add -b feat/login
+```
+
+You can also pass a user-approved path on ReFS explicitly instead of changing `cow.root`. Use the path printed by `git cow add`, or confirm it with `git cow list`; do not guess the path. NTFS and cross-volume template-to-worktree adds use the ordinary Git fallback described above.
 
 ## Create
 
@@ -96,7 +114,7 @@ Check out a branch that already exists. The path comes first. One argument is a 
 git cow add "$path" "$branch"
 ```
 
-Pass a path outside `~/.worktrees/<project>/` only when the user named one, or when the branch is already under `<project>/.claude/worktrees`. If the path exists, stop and tell the user. Do not add a numeric suffix.
+Pass a path outside the configured worktree root only when the user named one, or when the branch is already under `<project>/.claude/worktrees`. If the path exists, stop and tell the user. Do not add a numeric suffix.
 
 `add` handles `-b` and `-f`. Any other flag skips the clone. `-f` is `git worktree add --force`, and it also deletes a folder of files at the extra checkout path. Never pass `-f` unless the user asked for it. If `git cow add` refuses the extra checkout path, stop and tell the user, with the error.
 

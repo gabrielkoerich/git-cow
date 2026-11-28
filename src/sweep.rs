@@ -136,8 +136,9 @@ pub(crate) fn cleanup(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-// Repositories at or below `dir`, not looking inside one or inside hidden and build folders
-fn repositories(dir: &Path) -> Vec<PathBuf> {
+// Repositories at or below `dir`, not looking inside one or inside hidden and build folders.
+// Fail if the requested root cannot be opened; inaccessible descendants are skipped.
+fn repositories(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0)];
     while let Some((d, depth)) = stack.pop() {
@@ -150,8 +151,10 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
         if depth == 4 {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) if depth == 0 => return Err(e),
+            Err(_) => continue,
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -163,7 +166,7 @@ fn repositories(dir: &Path) -> Vec<PathBuf> {
         }
     }
     found.sort();
-    found
+    Ok(found)
 }
 
 /// List the worktrees of every repository at or below a folder, with how far their work landed
@@ -173,8 +176,14 @@ pub(crate) fn tree(args: &[String]) -> io::Result<()> {
         [d] if !d.starts_with('-') => PathBuf::from(d),
         _ => return Err(other("give one folder".into())),
     };
+    // Git for Windows does not accept the verbatim paths returned by canonicalize.
+    #[cfg(windows)]
+    let dir = std::path::absolute(dir)?;
+    #[cfg(not(windows))]
+    let dir = std::fs::canonicalize(dir)?;
+    let repositories = repositories(&dir)?;
     warn_without_squash_check();
-    for repo in repositories(&std::fs::canonicalize(&dir)?) {
+    for repo in repositories {
         let Ok(worktrees) = cleanup::survey(&repo) else {
             continue;
         };

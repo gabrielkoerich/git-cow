@@ -142,9 +142,7 @@ fn add(args: &[String]) -> ExitCode {
                 .unwrap_or_default()
                 .join(leaf),
             _ => git_cow::config_path(&repo, "cow.root")
-                .unwrap_or_else(|| {
-                    Path::new(&std::env::var("HOME").unwrap_or_default()).join(".worktrees")
-                })
+                .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join(".worktrees"))
                 .join(name)
                 .join(leaf),
         };
@@ -295,27 +293,29 @@ fn remove(args: &[String]) -> std::io::Result<()> {
     let [path] = paths.as_slice() else {
         return Err(other("give one worktree path".into()));
     };
-    // git lists real paths, macOS temp folders are /var behind a /private/var symlink
-    let wt = std::fs::canonicalize(path)?;
+    let real = std::fs::canonicalize(path)?;
     let all = worktrees(&repo)?;
-    let Some((_, branch)) = all.iter().find(|(p, _)| *p == wt) else {
+    // Resolve aliases for comparison, but pass Git its own path (not a Windows verbatim path).
+    let Some((wt, branch)) = all
+        .iter()
+        .find(|(p, _)| std::fs::canonicalize(p).is_ok_and(|p| p == real))
+    else {
         return Err(other(format!(
-            "{} is not a worktree of this repository",
-            wt.display()
+            "{path} is not a worktree of this repository"
         )));
     };
-    if is_extra_checkout(&repo, &wt) {
+    if is_extra_checkout(&repo, wt) {
         return Err(other(format!(
             "{} is the git-cow extra checkout, not removed",
             wt.display()
         )));
     }
-    if all.first().is_some_and(|(p, _)| *p == wt) {
+    if all.first().is_some_and(|(p, _)| p == wt) {
         return Err(other("that is the main checkout, not removed".into()));
     }
     if warm_first {
-        let template = template_for(&repo, &wt)?;
-        git_cow::warm_with(&wt, &template, &git_cow::Options::from_repo(&repo))?;
+        let template = template_for(&repo, wt)?;
+        git_cow::warm_with(wt, &template, &git_cow::Options::from_repo(&repo))?;
     }
     let wt_s = wt.to_string_lossy();
     let mut cmd = vec!["worktree", "remove"];

@@ -43,7 +43,7 @@ These are normal git worktrees, so `git worktree list` and `git worktree remove`
 
 1. git-cow keeps one extra checkout per repository, at `origin/HEAD`. It is a git worktree of your repository, so it uses your `.git` and the history is not stored twice. git-cow makes it by cloning your checkout and removing your edits and untracked files, so it takes disk only for the files that differ from `origin/HEAD`.
 2. The extra checkout gets copy-on-write clones of your checkout's ignored folders, such as `target/` and `node_modules`. This runs at most once an hour by default (`cow.warmInterval`).
-3. A new worktree is a copy-on-write clone of the extra checkout. macOS clones each folder in one `clonefile(2)` call. Linux uses `cp --reflink=always`.
+3. A new worktree is a copy-on-write clone of the extra checkout. macOS clones each folder in one `clonefile(2)` call. Linux uses `cp --reflink=always`. Windows walks the tree and clones each file's data with `FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS.
 4. Git then rewrites only the files where your branch differs from the extra checkout.
 
 If cloning is not possible, git-cow cleans up and runs plain `git worktree add` with your arguments.
@@ -68,7 +68,9 @@ The extra checkout sits next to the worktree, so tools with different layouts ea
 git config --global cow.base '~/.orch/state/templates/{repo}'
 ```
 
-Your checkout, the extra checkout and the worktrees must sit on one volume that supports cloning: APFS on macOS, btrfs or XFS formatted with `reflink=1` on Linux. On ext4 and HFS+, git-cow falls back to `git worktree add`.
+The extra checkout and the worktrees must be on the same clone-capable volume: APFS on macOS, btrfs or XFS with `reflink=1` on Linux, or ReFS with block cloning on Windows (including ReFS Dev Drives). Put your main checkout on that volume too if you want to share its build output. When the extra checkout cannot be cloned to the worktree (for example, on NTFS, ext4, HFS+, or across volumes), git-cow uses `git worktree add` instead.
+
+On Windows, the default `cow.root` is under your user profile, which is usually on NTFS. If `R:` is your ReFS volume, set `git config cow.root R:/worktrees` or pass a path on `R:` to `git cow add`. No `cp` or WSL is required. The Windows backend preserves file modification times and recreates symlinks without following them (this may require Developer Mode or symlink privileges). It clones file data, not ACLs or alternate data streams.
 
 ## Library
 
@@ -106,7 +108,7 @@ if matches!(plan.items()[0].action(), Action::Remove) {
 
 `cleanup::plan(repo, &opts)` judges every worktree and local branch, and changes nothing. `cleanup::execute(&plan)` removes what the plan marks, with the same checks and backup refs as the CLI, and returns what it did. `cleanup::survey(repo)` gives each worktree's state without reading its files, as `git cow tree` does. `Options` names the base branch and whether to remove landed worktrees with changes or a missing folder. A plan's items can be read but not changed, so `execute` only ever removes what the plan judged safe.
 
-The library is synchronous and has no dependencies. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
+The library is synchronous. Besides Git, it uses native APIs on macOS and Windows (via `windows-sys` on Windows) and GNU `cp` on Linux. A lock file next to the extra checkout stops two clones, from threads or processes, from seeing it half updated.
 
 ## Benchmarks
 

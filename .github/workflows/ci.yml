@@ -32,6 +32,8 @@ jobs:
           - {os: macos-latest, fs: apfs}
           - {os: ubuntu-latest, fs: xfs}
           - {os: ubuntu-latest, fs: ext4}
+          - {os: windows-2025, fs: ntfs}
+          - {os: windows-2025, fs: refs}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +58,42 @@ jobs:
         if: matrix.fs == 'apfs'
         run: echo "GIT_COW_EXPECT_CLONE=1" >> "$GITHUB_ENV"
 
+      - name: ReFS block-clone volume
+        if: matrix.fs == 'refs'
+        shell: pwsh
+        run: |
+          $image = Join-Path $env:RUNNER_TEMP 'git-cow-refs.vhdx'
+          $script = Join-Path $env:RUNNER_TEMP 'git-cow-diskpart.txt'
+          @(
+            "create vdisk file=`"$image`" maximum=4096 type=expandable"
+            "select vdisk file=`"$image`""
+            'attach vdisk'
+          ) | Set-Content -Encoding ascii $script
+          diskpart.exe /s $script
+          if ($LASTEXITCODE -ne 0) { throw 'Could not attach ReFS test disk' }
+          $disk = Get-DiskImage -ImagePath $image | Get-Disk
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT
+          $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+          $part | Format-Volume -FileSystem ReFS -AllocationUnitSize 65536 -Confirm:$false
+          $temp = "$($part.DriveLetter):\git-cow-tests"
+          New-Item -ItemType Directory -Path $temp | Out-Null
+          "TEMP=$temp", "TMP=$temp", 'GIT_COW_EXPECT_CLONE=1' >> $env:GITHUB_ENV
+      - name: Require fallback on NTFS
+        if: matrix.fs == 'ntfs'
+        shell: pwsh
+        run: "'GIT_COW_EXPECT_CLONE=0' >> $env:GITHUB_ENV"
+
       - run: cargo test
+
+      - name: Detach ReFS test disk
+        if: always() && matrix.fs == 'refs'
+        shell: pwsh
+        run: |
+          $image = Join-Path $env:RUNNER_TEMP 'git-cow-refs.vhdx'
+          if (Test-Path $image) {
+            if ((Get-DiskImage -ImagePath $image).Attached) { Dismount-DiskImage -ImagePath $image }
+            Remove-Item $image
+          }
 
   # On main: next version from conventional commits (feat minor, breaking major, else patch), publish, tag, release
   release:

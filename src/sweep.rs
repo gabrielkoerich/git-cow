@@ -174,7 +174,12 @@ pub(crate) fn tree(args: &[String]) -> io::Result<()> {
         _ => return Err(other("give one folder".into())),
     };
     warn_without_squash_check();
-    for repo in repositories(&std::fs::canonicalize(&dir)?) {
+    // Git for Windows does not accept the verbatim paths returned by canonicalize.
+    #[cfg(windows)]
+    let dir = std::path::absolute(dir)?;
+    #[cfg(not(windows))]
+    let dir = std::fs::canonicalize(dir)?;
+    for repo in repositories(&dir) {
         let Ok(worktrees) = cleanup::survey(&repo) else {
             continue;
         };

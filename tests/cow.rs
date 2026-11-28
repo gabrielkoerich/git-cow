@@ -1,4 +1,5 @@
 //! The library and the `git cow` command against real repositories and volumes
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,11 +24,6 @@ fn clean(dir: &Path) -> bool {
     out.stdout.is_empty()
 }
 
-// CI on a clone-capable volume sets this, so a failed probe fails the test instead of skipping
-fn expect_clone() -> bool {
-    std::env::var("GIT_COW_EXPECT_CLONE").is_ok_and(|v| v == "1")
-}
-
 // A remote, a clone of it with two committed files, and a scratch dir for templates and worktrees
 fn setup() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
     let remote = tempfile::tempdir().unwrap();
@@ -39,8 +35,9 @@ fn setup() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
     );
     sh(project.path(), &["config", "user.email", "t@t.com"]);
     sh(project.path(), &["config", "user.name", "T"]);
-    // the user's global config may sign commits through an agent that is not there in a test
+    // Keep signing and Windows line-ending conversion out of test fixtures.
     sh(project.path(), &["config", "commit.gpgsign", "false"]);
+    sh(project.path(), &["config", "core.autocrlf", "false"]);
     std::fs::write(project.path().join("a.txt"), "a\n").unwrap();
     std::fs::write(project.path().join("d.txt"), "d\n").unwrap();
     std::fs::write(
@@ -58,10 +55,12 @@ fn setup() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
 
 fn supported(scratch: &Path) -> bool {
     let ok = git_cow::can_clone(scratch, scratch);
-    if expect_clone() {
-        assert!(
+    // CI pins the expected capability so a broken probe cannot make the tests silently skip.
+    if let Ok(expect) = std::env::var("GIT_COW_EXPECT_CLONE") {
+        assert_eq!(
             ok,
-            "GIT_COW_EXPECT_CLONE is set but the volume cannot clone"
+            expect == "1",
+            "clone capability does not match GIT_COW_EXPECT_CLONE={expect}"
         );
     }
     ok
@@ -1510,6 +1509,7 @@ fn two_repositories_share_one_template_path() {
 }
 
 // A probe that cannot write is a clone error, not a volume without cloning, and falls back
+#[cfg(unix)]
 #[test]
 fn unwritable_template_parent_falls_back_with_the_reason() {
     let uid = Command::new("id").arg("-u").output().unwrap();
@@ -2002,6 +2002,7 @@ fn force_never_deletes_a_checkout_missing_head() {
 }
 
 // The warm-up writes only inside the template, never through a tracked symlink out of it
+#[cfg(unix)]
 #[test]
 fn warm_never_writes_through_a_symlink_out_of_the_template() {
     let (_r, project, scratch) = setup();
@@ -2482,6 +2483,7 @@ fn cleanup_handles_two_worktrees_on_one_branch() {
 }
 
 // A cow.base reached through a symlink is still the extra checkout, never a worktree to remove
+#[cfg(unix)]
 #[test]
 fn cleanup_knows_the_extra_checkout_behind_a_symlink() {
     let w = sweep_setup();
@@ -2600,9 +2602,13 @@ fn spy(dir: &Path, marker: &Path) -> PathBuf {
     let script = dir.join("spy.sh");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexit 1\n",
+            marker.to_string_lossy().replace('\\', "/")
+        ),
     )
     .unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     script
 }
@@ -2713,7 +2719,9 @@ fn tree_never_verifies_signatures_or_fetches() {
     );
     sh(p, &["push", "-q", "origin", "feat-active"]);
     let part = w.scratch.path().join("part");
-    let url = format!("file://{}", w.remote.path().display());
+    let remote = w.remote.path().to_string_lossy().replace('\\', "/");
+    let slash = if remote.starts_with('/') { "" } else { "/" };
+    let url = format!("file://{slash}{remote}");
     sh(
         w.scratch.path(),
         &[
@@ -3075,7 +3083,7 @@ fn cleanup_force_keeps_the_refs_of_a_missing_worktree() {
     );
 }
 
-// --force says which worktrees lose changes, and a path with a newline is read whole
+// --force says which worktrees lose changes, and unusual paths are read whole
 #[test]
 fn cleanup_marks_discarded_changes_and_reads_any_path() {
     let w = sweep_setup();
@@ -3086,7 +3094,11 @@ fn cleanup_marks_discarded_changes_and_reads_any_path() {
         Some("remove (discards changes)".into()),
         "{plan}"
     );
-    let odd = w.scratch.path().join("odd\nname");
+    let odd = w.scratch.path().join(if cfg!(windows) {
+        "odd name"
+    } else {
+        "odd\nname"
+    });
     sh(
         p,
         &[
@@ -3100,10 +3112,7 @@ fn cleanup_marks_discarded_changes_and_reads_any_path() {
         ],
     );
     ok(&cow(p, &["cleanup", "--yes"]));
-    assert!(
-        !odd.exists(),
-        "the worktree with a newline in its path stayed"
-    );
+    assert!(!odd.exists(), "the worktree with an unusual path stayed");
     assert!(w.wt("feat-active").exists());
 }
 

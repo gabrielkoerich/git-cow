@@ -46,6 +46,7 @@ name = "git-cow"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

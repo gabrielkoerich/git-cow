@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -308,8 +309,8 @@ fn squash_probe(repo: &Path, base: &str, rev: &str) -> Option<Probe> {
     })
 }
 
-// A new empty folder in the repository's git dir, which only its owner can write. A folder that
-// already exists is never reused, since git would read objects planted in it before the real ones
+// A new empty folder in the repository's git dir. On Unix use owner-only permissions; on
+// Windows inherit the repository's ACL. Never reuse an existing folder with untrusted objects.
 fn scratch_dir(common: &Path) -> Option<PathBuf> {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now()
@@ -318,7 +319,14 @@ fn scratch_dir(common: &Path) -> Option<PathBuf> {
     for _ in 0..8 {
         let n = COUNT.fetch_add(1, Ordering::Relaxed);
         let dir = common.join(format!("git-cow-merge-{}-{nanos}-{n}", std::process::id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&dir) {
             Ok(()) => return Some(dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return None,
